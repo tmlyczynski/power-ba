@@ -27,6 +27,7 @@ Main options:
 Settings include:
 - OpenAI API key / Anthropic API key
 - provider/model switch
+- AI response language (`pl` / `en`)
 - STT backend switch (`vosk` / `whisper_cpp`)
 - whisper.cpp model path and binary path
 - mic listening on/off
@@ -35,6 +36,9 @@ Settings include:
 - main prompt (role prompt)
 - mic and monitor source
 - mic and monitor source picker from detected list (in TUI Settings)
+- default output directory
+- save audio files on/off
+- save transcript and AI logs on/off
 - diarization on/off + pyannote token/model
 
 Runtime controls during session:
@@ -46,7 +50,10 @@ Runtime controls during session:
 - `k` list known and ignored speakers
 - `g` force immediate AI question generation (without waiting for interval)
 - `a <text>` send a custom AI request (refine or ask a new follow-up)
-- `s` save context snapshot (if `--output` is set)
+- `lang <pl|en>` change AI response language in current session
+- `style <text>` set persistent AI style for whole session
+- `style clear` clear persistent AI style
+- `s` save context snapshot (when output directory is configured)
 - `q` stop session
 
 In TUI session view, commands with descriptions are always visible above the log,
@@ -167,6 +174,15 @@ python3 -m power_ba.cli start --question-interval 30
 Disable periodic generation and use only manual `g` trigger:
 ```bash
 python3 -m power_ba.cli start --no-auto-interval
+```
+
+Start with English AI and save only transcript logs:
+```bash
+python3 -m power_ba.cli start \
+	--ai-language en \
+	--output ~/meeting-logs \
+	--no-save-audio \
+	--save-transcript
 ```
 
 Dry-run (no real audio capture):

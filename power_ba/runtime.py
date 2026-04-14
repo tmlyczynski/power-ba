@@ -34,6 +34,15 @@ def _emit(emit: OutputEmitter, message: str) -> None:
     emit(message)
 
 
+def _parse_ai_language(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if normalized in {"en", "english", "angielski"}:
+        return "en"
+    if normalized in {"pl", "polski", "polish"}:
+        return "pl"
+    return None
+
+
 @dataclass
 class RuntimeState:
     paused: bool = False
@@ -43,6 +52,8 @@ class RuntimeState:
     snapshot_requested: bool = False
     force_generation_requested: bool = False
     custom_query_requests: list[str] = field(default_factory=list)
+    ai_language: str = "pl"
+    ai_style_instruction: str = ""
     ignored_speakers: set[str] = field(default_factory=set)
     known_speakers: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -123,6 +134,33 @@ class RuntimeState:
             self.custom_query_requests.clear()
             return pending
 
+    def set_ai_language(self, language: str) -> str | None:
+        cleaned = language.strip()
+        if not cleaned:
+            return None
+
+        normalized = _parse_ai_language(cleaned)
+        if normalized is None:
+            return None
+
+        with self._lock:
+            self.ai_language = normalized
+        return normalized
+
+    def get_ai_language(self) -> str:
+        with self._lock:
+            return self.ai_language
+
+    def set_ai_style_instruction(self, instruction: str) -> str:
+        cleaned = instruction.strip()
+        with self._lock:
+            self.ai_style_instruction = cleaned
+            return self.ai_style_instruction
+
+    def get_ai_style_instruction(self) -> str:
+        with self._lock:
+            return self.ai_style_instruction
+
     def register_speaker(self, speaker: str) -> None:
         cleaned = speaker.strip()
         if not cleaned:
@@ -198,7 +236,9 @@ def _print_controls_help(
     _emit(emit, "  k          show known speakers and ignored speakers")
     _emit(emit, "  g          generate AI questions now (manual trigger)")
     _emit(emit, "  a <text>   send custom AI query / refine follow-up")
-    _emit(emit, "  s          save text snapshot (requires --output)")
+    _emit(emit, "  lang <pl|en> set AI response language")
+    _emit(emit, "  style <text> set persistent AI style for this session")
+    _emit(emit, "  s          save text snapshot (requires output directory)")
     _emit(emit, "  h          show this help again")
     _emit(emit, "  q          stop current session")
 
@@ -213,9 +253,12 @@ def run_session(
     question_interval_override: int | None = None,
     interval_enabled_override: bool | None = None,
     output_dir: Path | None = None,
+    save_audio_override: bool | None = None,
+    save_transcript_override: bool | None = None,
     dry_run: bool = False,
     max_runtime: int | None = None,
     interactive_controls: bool = True,
+    show_controls_help: bool = True,
     command_queue: queue.Queue[str] | None = None,
     event_callback: OutputEmitter | None = None,
 ) -> None:
@@ -236,7 +279,10 @@ def run_session(
     if question_interval < 5:
         question_interval = 5
 
-    state = RuntimeState(mic_enabled=config.mic_listening_enabled)
+    state = RuntimeState(
+        mic_enabled=config.mic_listening_enabled,
+        ai_language=config.ai_language,
+    )
     required_window = question_interval if question_interval_enabled else 60
     context = ConversationContext(window_seconds=max(config.context_window_seconds, required_window))
     llm_client = build_llm_client(
@@ -256,10 +302,22 @@ def run_session(
     )
 
     logger: JsonlLogger | None = None
-    out_dir: Path | None = None
-    if output_dir is not None:
-        out_dir = output_dir.expanduser().resolve()
+    out_dir = _resolve_output_directory(config=config, output_dir_override=output_dir)
+    save_audio_to_files = config.save_audio_by_default if save_audio_override is None else save_audio_override
+    save_transcript_to_files = (
+        config.save_transcript_by_default if save_transcript_override is None else save_transcript_override
+    )
+
+    if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    if (save_audio_to_files or save_transcript_to_files) and out_dir is None:
+        _emit(
+            emit,
+            "File saving enabled but output directory is not set. Configure output path in settings or use --output.",
+        )
+
+    if save_transcript_to_files and out_dir is not None:
         logger = JsonlLogger(out_dir / "session.jsonl")
 
     _emit(emit, "Consent reminder: use this app only when participants consent to recording/transcription.")
@@ -295,6 +353,7 @@ def run_session(
                 question_interval=question_interval,
                 question_interval_enabled=question_interval_enabled,
                 controls_enabled=controls_enabled,
+                show_controls_help=show_controls_help,
                 output_dir=out_dir,
                 start_time=start_time,
                 max_runtime=max_runtime,
@@ -313,7 +372,9 @@ def run_session(
                 question_interval=question_interval,
                 question_interval_enabled=question_interval_enabled,
                 controls_enabled=controls_enabled,
+                show_controls_help=show_controls_help,
                 output_dir=out_dir,
+                save_audio_to_files=save_audio_to_files,
                 start_time=start_time,
                 next_question_time=next_question_time,
                 max_runtime=max_runtime,
@@ -327,6 +388,17 @@ def run_session(
     _emit(emit, "Session stopped.")
 
 
+def _resolve_output_directory(config: AppConfig, output_dir_override: Path | None) -> Path | None:
+    if output_dir_override is not None:
+        return output_dir_override.expanduser().resolve()
+
+    configured = config.default_output_dir.strip()
+    if not configured:
+        return None
+
+    return Path(configured).expanduser().resolve()
+
+
 def _run_live_session(
     config: AppConfig,
     state: RuntimeState,
@@ -338,7 +410,9 @@ def _run_live_session(
     question_interval: int,
     question_interval_enabled: bool,
     controls_enabled: bool,
+    show_controls_help: bool,
     output_dir: Path | None,
+    save_audio_to_files: bool,
     start_time: float,
     next_question_time: float | None,
     max_runtime: int | None,
@@ -374,12 +448,14 @@ def _run_live_session(
     except SttEngineError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    capture.start(output_dir=output_dir)
+    capture.start(output_dir=output_dir if save_audio_to_files else None)
     _emit(emit, "Capture started.")
-    if controls_enabled:
+    if controls_enabled and show_controls_help:
         _print_controls_help(question_interval_enabled, emit=emit)
 
-    next_controls_reminder = time.time() + CONTROL_REMINDER_SECONDS if controls_enabled else None
+    next_controls_reminder = (
+        time.time() + CONTROL_REMINDER_SECONDS if controls_enabled and show_controls_help else None
+    )
 
     try:
         while not state.should_stop():
@@ -405,7 +481,15 @@ def _run_live_session(
 
             if state.is_paused():
                 if state.consume_force_generation_request():
-                    _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
+                    _emit_questions(
+                        context,
+                        main_prompt,
+                        llm_client,
+                        logger,
+                        ai_language=state.get_ai_language(),
+                        style_instruction=state.get_ai_style_instruction(),
+                        emit=emit,
+                    )
                 if state.consume_snapshot_request():
                     _save_snapshot(context, output_dir, logger, emit=emit)
 
@@ -460,11 +544,27 @@ def _run_live_session(
                         )
 
             if state.consume_force_generation_request():
-                _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
+                _emit_questions(
+                    context,
+                    main_prompt,
+                    llm_client,
+                    logger,
+                    ai_language=state.get_ai_language(),
+                    style_instruction=state.get_ai_style_instruction(),
+                    emit=emit,
+                )
 
             now = time.time()
             if question_interval_enabled and next_question_time is not None and now >= next_question_time:
-                _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
+                _emit_questions(
+                    context,
+                    main_prompt,
+                    llm_client,
+                    logger,
+                    ai_language=state.get_ai_language(),
+                    style_instruction=state.get_ai_style_instruction(),
+                    emit=emit,
+                )
                 next_question_time = now + question_interval
 
             if state.consume_snapshot_request():
@@ -509,6 +609,7 @@ def _run_dry_session(
     question_interval: int,
     question_interval_enabled: bool,
     controls_enabled: bool,
+    show_controls_help: bool,
     output_dir: Path | None,
     start_time: float,
     max_runtime: int | None,
@@ -516,7 +617,7 @@ def _run_dry_session(
     emit: OutputEmitter,
 ) -> None:
     _emit(emit, "Dry-run mode enabled. No real audio capture is used.")
-    if controls_enabled:
+    if controls_enabled and show_controls_help:
         _print_controls_help(question_interval_enabled, emit=emit)
 
     scripted = [
@@ -529,7 +630,9 @@ def _run_dry_session(
     index = 0
     next_phrase_time = start_time
     next_question_time = start_time + question_interval if question_interval_enabled else None
-    next_controls_reminder = time.time() + CONTROL_REMINDER_SECONDS if controls_enabled else None
+    next_controls_reminder = (
+        time.time() + CONTROL_REMINDER_SECONDS if controls_enabled and show_controls_help else None
+    )
 
     while not state.should_stop():
         now = time.time()
@@ -555,7 +658,15 @@ def _run_dry_session(
 
         if state.is_paused():
             if state.consume_force_generation_request():
-                _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
+                _emit_questions(
+                    context,
+                    main_prompt,
+                    llm_client,
+                    logger,
+                    ai_language=state.get_ai_language(),
+                    style_instruction=state.get_ai_style_instruction(),
+                    emit=emit,
+                )
             if state.consume_snapshot_request():
                 _save_snapshot(context, output_dir, logger, emit=emit)
 
@@ -587,10 +698,26 @@ def _run_dry_session(
                 _handle_transcript(source, text, context, logger, speaker_label=speaker_label, emit=emit)
 
         if state.consume_force_generation_request():
-            _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
+            _emit_questions(
+                context,
+                main_prompt,
+                llm_client,
+                logger,
+                ai_language=state.get_ai_language(),
+                style_instruction=state.get_ai_style_instruction(),
+                emit=emit,
+            )
 
         if question_interval_enabled and next_question_time is not None and now >= next_question_time:
-            _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
+            _emit_questions(
+                context,
+                main_prompt,
+                llm_client,
+                logger,
+                ai_language=state.get_ai_language(),
+                style_instruction=state.get_ai_style_instruction(),
+                emit=emit,
+            )
             next_question_time = now + question_interval
 
         if state.consume_snapshot_request():
@@ -645,6 +772,8 @@ def _emit_questions(
     main_prompt: str,
     llm_client: LlmClient,
     logger: JsonlLogger | None,
+    ai_language: str,
+    style_instruction: str,
     emit: OutputEmitter,
 ) -> None:
     payload = context.render_for_prompt(main_prompt=main_prompt)
@@ -652,7 +781,11 @@ def _emit_questions(
         _emit(emit, "[AI] Waiting for more conversation context.")
         return
 
-    answer = llm_client.generate_questions(payload)
+    answer = llm_client.generate_questions(
+        payload,
+        ai_language=ai_language,
+        style_instruction=style_instruction,
+    )
     _emit(emit, "\n[AI QUESTIONS]\n" + answer + "\n")
 
     if logger is not None:
@@ -668,12 +801,16 @@ def _drain_custom_query_requests(
     emit: OutputEmitter,
 ) -> None:
     for query in state.consume_custom_query_requests():
+        ai_language = state.get_ai_language()
+        style_instruction = state.get_ai_style_instruction()
         _emit_custom_query_response(
             query=query,
             context=context,
             main_prompt=main_prompt,
             llm_client=llm_client,
             logger=logger,
+            ai_language=ai_language,
+            style_instruction=style_instruction,
             emit=emit,
         )
 
@@ -684,6 +821,8 @@ def _emit_custom_query_response(
     main_prompt: str,
     llm_client: LlmClient,
     logger: JsonlLogger | None,
+    ai_language: str,
+    style_instruction: str,
     emit: OutputEmitter,
 ) -> None:
     base_payload = context.render_for_prompt(main_prompt=main_prompt)
@@ -700,7 +839,11 @@ def _emit_custom_query_response(
         "Answer this custom request directly and keep the answer practical."
     )
 
-    answer = llm_client.generate_questions(prompt_payload)
+    answer = llm_client.generate_questions(
+        prompt_payload,
+        ai_language=ai_language,
+        style_instruction=style_instruction,
+    )
     _emit(emit, "\n[AI CUSTOM RESPONSE]\n" + answer + "\n")
 
     if logger is not None:
@@ -838,6 +981,40 @@ def _process_control_command(
             _emit(emit, "Usage: a <your custom AI query>")
             return
         _emit(emit, "Custom AI query requested.")
+    elif cmd in {"lang", "language", "l"}:
+        language_value = ""
+        if len(parts) > 1:
+            language_value = parts[1].split()[0].strip().lower()
+        if not language_value:
+            current = state.get_ai_language()
+            _emit(emit, f"Current AI language: {current}")
+            _emit(emit, "Usage: lang <pl|en>")
+            return
+
+        updated = state.set_ai_language(language_value)
+        if updated is None:
+            _emit(emit, "Unsupported language. Use: pl or en")
+            return
+
+        _emit(emit, f"AI language set to: {updated}")
+    elif cmd in {"style", "st"}:
+        style_value = parts[1].strip() if len(parts) > 1 else ""
+        if not style_value:
+            current_style = state.get_ai_style_instruction()
+            if current_style:
+                _emit(emit, f"Current AI style: {current_style}")
+            else:
+                _emit(emit, "Current AI style: (not set)")
+            _emit(emit, "Usage: style <text> or style clear")
+            return
+
+        if style_value.lower() in {"clear", "off", "none"}:
+            state.set_ai_style_instruction("")
+            _emit(emit, "AI style instruction cleared.")
+            return
+
+        state.set_ai_style_instruction(style_value)
+        _emit(emit, "AI style instruction updated.")
     elif cmd == "s":
         state.request_snapshot()
         _emit(emit, "Snapshot requested.")
@@ -845,7 +1022,10 @@ def _process_control_command(
         state.request_stop()
         _emit(emit, "Stop requested.")
     else:
-        _emit(emit, "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, s, q")
+        _emit(
+            emit,
+            "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, s, q",
+        )
 
 
 def _resolve_stt_backend_with_fallback(config: AppConfig, emit: OutputEmitter) -> str:

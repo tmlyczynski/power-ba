@@ -24,6 +24,7 @@ class AppConfig:
     question_interval_enabled: bool = True
     question_interval_seconds: int = 30
     context_window_seconds: int = 120
+    ai_language: str = "pl"
     main_prompt: str = DEFAULT_MAIN_PROMPT
     stt_backend: str = "vosk"
     vosk_model_path: str = ""
@@ -33,7 +34,9 @@ class AppConfig:
     whisper_cpp_language: str = "pl"
     mic_source: str = ""
     monitor_source: str = ""
+    default_output_dir: str = ""
     save_audio_by_default: bool = False
+    save_transcript_by_default: bool = False
     diarization_enabled: bool = False
     diarization_backend: str = "pyannote"
     pyannote_hf_token: str = ""
@@ -56,6 +59,11 @@ class AppConfig:
             self.model = "gpt-5-mini"
         if self.question_interval_seconds < 5:
             self.question_interval_seconds = 5
+        normalized_language = self.ai_language.strip().lower()
+        if normalized_language in {"en", "english"}:
+            self.ai_language = "en"
+        else:
+            self.ai_language = "pl"
         required_window = self.question_interval_seconds if self.question_interval_enabled else 60
         if self.context_window_seconds < required_window:
             self.context_window_seconds = max(required_window, 60)
@@ -75,6 +83,7 @@ class AppConfig:
             self.diarization_max_buffer_seconds = 30
         if not self.main_prompt.strip():
             self.main_prompt = DEFAULT_MAIN_PROMPT
+        self.default_output_dir = self.default_output_dir.strip()
 
 
 def resolve_config_path(config_path: Path | None = None) -> Path:

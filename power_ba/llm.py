@@ -4,7 +4,12 @@ from dataclasses import dataclass
 
 
 class LlmClient:
-    def generate_questions(self, prompt_payload: str) -> str:
+    def generate_questions(
+        self,
+        prompt_payload: str,
+        ai_language: str = "pl",
+        style_instruction: str = "",
+    ) -> str:
         raise NotImplementedError
 
 
@@ -12,8 +17,42 @@ class LlmClient:
 class DisabledLlmClient(LlmClient):
     reason: str
 
-    def generate_questions(self, prompt_payload: str) -> str:
+    def generate_questions(
+        self,
+        prompt_payload: str,
+        ai_language: str = "pl",
+        style_instruction: str = "",
+    ) -> str:
         return f"[AI disabled] {self.reason}"
+
+
+def _normalize_ai_language(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"en", "english"}:
+        return "en"
+    return "pl"
+
+
+def _build_system_instruction(ai_language: str, style_instruction: str) -> str:
+    language = _normalize_ai_language(ai_language)
+    style = style_instruction.strip()
+
+    if language == "en":
+        base = (
+            "Prepare concrete follow-up questions or direct practical answers "
+            "based on the provided context. Respond in English."
+        )
+        if style:
+            return f"{base}\nSession style instruction: {style}"
+        return base
+
+    base = (
+        "Przygotuj konkretne pytania doprecyzowujace lub bezposrednie praktyczne "
+        "odpowiedzi na podstawie podanego kontekstu. Odpowiedz po polsku."
+    )
+    if style:
+        return f"{base}\nInstrukcja stylu sesji: {style}"
+    return base
 
 
 class OpenAiClient(LlmClient):
@@ -29,14 +68,19 @@ class OpenAiClient(LlmClient):
         self._client = OpenAI(api_key=api_key)
         self._model = model
 
-    def generate_questions(self, prompt_payload: str) -> str:
+    def generate_questions(
+        self,
+        prompt_payload: str,
+        ai_language: str = "pl",
+        style_instruction: str = "",
+    ) -> str:
         try:
             response = self._client.responses.create(
                 model=self._model,
                 input=[
                     {
                         "role": "system",
-                        "content": "Przygotuj konkretne pytania doprecyzowujace. Odpowiedz po polsku.",
+                        "content": _build_system_instruction(ai_language, style_instruction),
                     },
                     {"role": "user", "content": prompt_payload},
                 ],
@@ -71,12 +115,17 @@ class AnthropicClient(LlmClient):
         self._client = Anthropic(api_key=api_key)
         self._model = model
 
-    def generate_questions(self, prompt_payload: str) -> str:
+    def generate_questions(
+        self,
+        prompt_payload: str,
+        ai_language: str = "pl",
+        style_instruction: str = "",
+    ) -> str:
         try:
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=400,
-                system="Przygotuj konkretne pytania doprecyzowujace. Odpowiedz po polsku.",
+                system=_build_system_instruction(ai_language, style_instruction),
                 messages=[{"role": "user", "content": prompt_payload}],
             )
         except Exception as exc:  # pragma: no cover

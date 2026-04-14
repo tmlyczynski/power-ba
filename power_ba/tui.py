@@ -29,6 +29,8 @@ SESSION_COMMANDS_TEXT = (
     "k        pokaz znanych i ignorowanych mowcow\n"
     "g        wygeneruj pytania AI teraz\n"
     "a tekst  doprecyzuj/wyslij nowe zapytanie do AI\n"
+    "lang en  zmien jezyk AI (pl/en)\n"
+    "style t  ustaw styl odpowiedzi AI na cala sesje\n"
     "s        zapisz snapshot (gdy ustawiono output)\n"
     "q        zatrzymaj sesje"
 )
@@ -46,7 +48,7 @@ class MainMenuScreen(Screen[None]):
             Button("2. Settings", id="settings", variant="primary"),
             Button("3. Exit", id="exit", variant="error"),
             Static(
-                "During session controls: h, p, m, i [sec], x <speaker>, k, g, a <text>, s, q",
+                "During session controls: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, s, q",
                 id="hints",
             ),
             id="menu",
@@ -86,7 +88,7 @@ class SessionScreen(Screen[None]):
             Static(SESSION_COMMANDS_TEXT, id="session_commands"),
             RichLog(id="session_log", wrap=True, markup=False, highlight=False),
             Input(
-                placeholder="Wpisz komende (h, p, m, i 30, x SPEAKER_00, g, a doprecyzuj cel, q)",
+                placeholder="Wpisz komende (g, a doprecyzuj..., lang en, style tylko ryzyka, q)",
                 id="session_input",
             ),
             id="session_view",
@@ -121,6 +123,7 @@ class SessionScreen(Screen[None]):
             run_session(
                 config=self._config,
                 interactive_controls=True,
+                show_controls_help=False,
                 command_queue=self._commands,
                 event_callback=self._emit_from_thread,
             )
@@ -218,6 +221,7 @@ class SettingsScreen(Screen[None]):
             Label("Settings", id="settings_title"),
             Input(value=self._working.provider, id="provider", placeholder="provider: openai/anthropic"),
             Input(value=self._working.model, id="model", placeholder="model name"),
+            Input(value=self._working.ai_language, id="ai_language", placeholder="AI language (pl/en)"),
             Input(
                 value=self._working.openai_api_key,
                 id="openai_api_key",
@@ -244,6 +248,15 @@ class SettingsScreen(Screen[None]):
             Static("Microphone source", id="mic_source_label"),
             Static(self._working.mic_source or "(not set)", id="mic_source_value"),
             Button("Select microphone source", id="pick_mic_source", variant="primary"),
+            Input(
+                value=self._working.default_output_dir,
+                id="default_output_dir",
+                placeholder="output directory for saved files",
+            ),
+            Static("Save audio files"),
+            Switch(value=self._working.save_audio_by_default, id="save_audio_by_default"),
+            Static("Save transcript/AI logs"),
+            Switch(value=self._working.save_transcript_by_default, id="save_transcript_by_default"),
             Input(value=self._working.stt_backend, id="stt_backend", placeholder="stt backend: vosk/whisper_cpp"),
             Input(value=self._working.vosk_model_path, id="vosk_model_path", placeholder="vosk model path"),
             Input(
@@ -339,9 +352,11 @@ class SettingsScreen(Screen[None]):
 
         self._working.provider = self.query_one("#provider", Input).value.strip().lower()
         self._working.model = self.query_one("#model", Input).value.strip()
+        self._working.ai_language = self.query_one("#ai_language", Input).value.strip().lower()
         self._working.openai_api_key = self.query_one("#openai_api_key", Input).value.strip()
         self._working.anthropic_api_key = self.query_one("#anthropic_api_key", Input).value.strip()
         self._working.main_prompt = self.query_one("#main_prompt", Input).value.strip()
+        self._working.default_output_dir = self.query_one("#default_output_dir", Input).value.strip()
         self._working.stt_backend = self.query_one("#stt_backend", Input).value.strip()
         self._working.vosk_model_path = self.query_one("#vosk_model_path", Input).value.strip()
         self._working.whisper_cpp_model_path = self.query_one("#whisper_cpp_model_path", Input).value.strip()
@@ -353,6 +368,8 @@ class SettingsScreen(Screen[None]):
         self._working.mic_listening_enabled = self.query_one("#mic_listening_enabled", Switch).value
         self._working.diarization_enabled = self.query_one("#diarization_enabled", Switch).value
         self._working.question_interval_enabled = self.query_one("#question_interval_enabled", Switch).value
+        self._working.save_audio_by_default = self.query_one("#save_audio_by_default", Switch).value
+        self._working.save_transcript_by_default = self.query_one("#save_transcript_by_default", Switch).value
 
         self._working.question_interval_seconds = _safe_int(
             self.query_one("#question_interval_seconds", Input).value,
