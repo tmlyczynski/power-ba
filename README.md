@@ -101,6 +101,21 @@ To remove user installation:
 ./uninstall.sh
 ```
 
+Install whisper.cpp + model on Arch (recommended helper):
+```bash
+./install-whisper-arch.sh
+```
+
+This script first tries AUR install (`whisper.cpp` + model). If AUR fails
+(for example mirror errors like `openblas ... 404`), it automatically falls
+back to building `whisper.cpp` from source and downloads the model.
+
+Useful variants:
+```bash
+./install-whisper-arch.sh --source-only
+./install-whisper-arch.sh --model small
+```
+
 Optional diarization dependencies:
 ```bash
 pip install -r requirements-diarization.txt
@@ -168,6 +183,11 @@ python3 -m power_ba.cli start \
 	--stt-backend whisper_cpp \
 	--whisper-model-path /path/to/ggml-model.bin \
 	--whisper-binary whisper-cli
+```
+
+If installed with `install-whisper-arch.sh`, model is usually here:
+```bash
+~/.local/share/power-ba/whisper.cpp/models/ggml-small.bin
 ```
 
 ## Notes
