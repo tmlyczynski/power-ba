@@ -27,7 +27,7 @@ class MainMenuScreen(Screen[None]):
             Button("2. Settings", id="settings", variant="primary"),
             Button("3. Exit", id="exit", variant="error"),
             Static(
-                "During session controls: p, m, i [sec], x <speaker>, k, g, s, q",
+                "During session controls: h, p, m, i [sec], x <speaker>, k, g, s, q",
                 id="hints",
             ),
             id="menu",

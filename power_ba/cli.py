@@ -6,11 +6,15 @@ from pathlib import Path
 
 import typer
 
-from .capture import list_pulse_sources
+from .capture import list_mic_sources, list_monitor_sources, list_pulse_sources
 from .config import AppConfig, DEFAULT_CONFIG_PATH, load_config, save_config
 from .runtime import run_session
 
 app = typer.Typer(add_completion=False, no_args_is_help=False, help="Power BA meeting assistant CLI")
+
+
+def run() -> None:
+    app()
 
 
 @app.callback(invoke_without_command=True)
@@ -53,8 +57,22 @@ def list_sources() -> None:
         print("No sources found. Is pactl available?")
         return
 
-    for source in sources:
-        print(source)
+    monitors = list_monitor_sources()
+    mics = list_mic_sources()
+
+    print("Monitor sources:")
+    if monitors:
+        for source in monitors:
+            print(f"  - {source}")
+    else:
+        print("  (none)")
+
+    print("Microphone sources:")
+    if mics:
+        for source in mics:
+            print(f"  - {source}")
+    else:
+        print("  (none)")
 
 
 @app.command()
@@ -327,9 +345,15 @@ def _ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 
 def _select_source(kind: str, current: str) -> str | None:
-    sources = list_pulse_sources()
+    if kind == "monitor":
+        sources = list_monitor_sources()
+    elif kind == "mic":
+        sources = list_mic_sources()
+    else:
+        sources = list_pulse_sources()
+
     if not sources:
-        print("No PulseAudio/PipeWire sources found.")
+        print(f"No {kind} sources found.")
         return None
 
     print(f"Available {kind} sources:")
@@ -355,4 +379,4 @@ def _select_source(kind: str, current: str) -> str | None:
 
 
 if __name__ == "__main__":
-    app()
+    run()

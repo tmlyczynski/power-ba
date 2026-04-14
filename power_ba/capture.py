@@ -36,6 +36,79 @@ def list_pulse_sources() -> list[str]:
     return sources
 
 
+def list_monitor_sources() -> list[str]:
+    return [source for source in list_pulse_sources() if _is_monitor_source(source)]
+
+
+def list_mic_sources() -> list[str]:
+    return [source for source in list_pulse_sources() if not _is_monitor_source(source)]
+
+
+def choose_default_monitor_source(sources: list[str]) -> str | None:
+    if not sources:
+        return None
+
+    default_sink = _get_default_sink_name()
+    if default_sink:
+        candidate = f"{default_sink}.monitor"
+        if candidate in sources:
+            return candidate
+
+    if len(sources) == 1:
+        return sources[0]
+
+    return sources[0]
+
+
+def choose_default_mic_source(sources: list[str]) -> str | None:
+    if not sources:
+        return None
+
+    default_source = _get_default_source_name()
+    if default_source and default_source in sources:
+        return default_source
+
+    if len(sources) == 1:
+        return sources[0]
+
+    return sources[0]
+
+
+def _is_monitor_source(source_name: str) -> bool:
+    normalized = source_name.strip().lower()
+    return normalized.endswith(".monitor") or ".monitor" in normalized
+
+
+def _get_default_source_name() -> str | None:
+    try:
+        result = subprocess.run(
+            ["pactl", "get-default-source"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    value = result.stdout.strip()
+    return value or None
+
+
+def _get_default_sink_name() -> str | None:
+    try:
+        result = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    value = result.stdout.strip()
+    return value or None
+
+
 class PulseAudioCapture:
     def __init__(
         self,

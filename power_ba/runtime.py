@@ -7,12 +7,20 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .capture import PulseAudioCapture
+from .capture import (
+    PulseAudioCapture,
+    choose_default_mic_source,
+    choose_default_monitor_source,
+    list_mic_sources,
+    list_monitor_sources,
+)
 from .config import AppConfig
 from .context import ConversationContext
 from .diarization import BaseSpeakerDiarizer, build_speaker_diarizer
 from .llm import LlmClient, build_llm_client
 from .stt import SttEngineError, build_stt_engine
+
+CONTROL_REMINDER_SECONDS = 30.0
 
 
 @dataclass
@@ -143,6 +151,28 @@ class JsonlLogger:
             self._file.close()
 
 
+def _print_controls_help(question_interval_enabled: bool, reminder: bool = False) -> None:
+    if reminder:
+        print("\n=== Controls reminder ===")
+    else:
+        print("\n=== Session controls ===")
+
+    print("  p          pause or resume processing (STT + AI)")
+    print("  m          toggle microphone listening on/off")
+    print("  i <sec>    ignore all remote audio for N seconds")
+    print("  x <id>     ignore/unignore selected remote speaker id")
+    print("  k          show known speakers and ignored speakers")
+    print("  g          generate AI questions now (manual trigger)")
+    print("  s          save text snapshot (requires --output)")
+    print("  h          show this help again")
+    print("  q          stop current session")
+
+    if question_interval_enabled:
+        print("Auto AI generation is ON (periodic interval).")
+    else:
+        print("Auto AI generation is OFF. Use `g` to generate on demand.")
+
+
 def run_session(
     config: AppConfig,
     question_interval_override: int | None = None,
@@ -197,8 +227,9 @@ def run_session(
     print("Consent reminder: use this app only when participants consent to recording/transcription.")
     if diarizer.status_message:
         print(f"Diarization: {diarizer.status_message}")
-    if interactive_controls and sys.stdin.isatty():
-        _start_controls_thread(state)
+    controls_enabled = interactive_controls and sys.stdin.isatty()
+    if controls_enabled:
+        _start_controls_thread(state, question_interval_enabled=question_interval_enabled)
     else:
         print("Interactive controls disabled. Use CLI flags to control runtime.")
 
@@ -215,6 +246,7 @@ def run_session(
                 main_prompt=config.main_prompt,
                 question_interval=question_interval,
                 question_interval_enabled=question_interval_enabled,
+                controls_enabled=controls_enabled,
                 output_dir=out_dir,
                 start_time=start_time,
                 max_runtime=max_runtime,
@@ -230,6 +262,7 @@ def run_session(
                 main_prompt=config.main_prompt,
                 question_interval=question_interval,
                 question_interval_enabled=question_interval_enabled,
+                controls_enabled=controls_enabled,
                 output_dir=out_dir,
                 start_time=start_time,
                 next_question_time=next_question_time,
@@ -252,29 +285,31 @@ def _run_live_session(
     main_prompt: str,
     question_interval: int,
     question_interval_enabled: bool,
+    controls_enabled: bool,
     output_dir: Path | None,
     start_time: float,
     next_question_time: float | None,
     max_runtime: int | None,
 ) -> None:
-    if not config.monitor_source:
-        raise RuntimeError("Monitor source is not set. Configure it in settings first.")
-
-    if config.mic_listening_enabled and not config.mic_source:
-        print("Mic listening is enabled but mic source is empty. Continuing with remote-only capture.")
+    allow_prompt = sys.stdin.isatty()
+    monitor_source, mic_source = _resolve_live_audio_sources(config, allow_prompt=allow_prompt)
+    if config.mic_listening_enabled and not mic_source:
+        print("Mic listening enabled but no mic selected. Continuing with remote-only capture.")
 
     capture = PulseAudioCapture(
-        mic_source=config.mic_source,
-        monitor_source=config.monitor_source,
+        mic_source=mic_source,
+        monitor_source=monitor_source,
         sample_rate=16000,
         channels=1,
         chunk_ms=100,
         is_source_enabled=lambda source: state.is_mic_enabled() if source == "mic" else True,
     )
 
+    stt_backend = _resolve_stt_backend_with_fallback(config)
+
     try:
         stt_engine = build_stt_engine(
-            backend=config.stt_backend,
+            backend=stt_backend,
             vosk_model_path=config.vosk_model_path,
             sample_rate=16000,
             whisper_cpp_model_path=config.whisper_cpp_model_path,
@@ -286,14 +321,11 @@ def _run_live_session(
         raise RuntimeError(str(exc)) from exc
 
     capture.start(output_dir=output_dir)
-    print(
-        "Capture started. Controls: p=pause/resume, m=mic on/off, i [sec]=ignore remote, "
-        "x <speaker>=ignore speaker, k=list speakers, g=generate now, s=snapshot, q=stop"
-    )
-    if question_interval_enabled:
-        print(f"Auto AI generation enabled every {question_interval}s.")
-    else:
-        print("Auto AI generation disabled. Use `g` to generate questions on demand.")
+    print("Capture started.")
+    if controls_enabled:
+        _print_controls_help(question_interval_enabled)
+
+    next_controls_reminder = time.time() + CONTROL_REMINDER_SECONDS if controls_enabled else None
 
     try:
         while not state.should_stop():
@@ -307,6 +339,15 @@ def _run_live_session(
                     _emit_questions(context, main_prompt, llm_client, logger)
                 if state.consume_snapshot_request():
                     _save_snapshot(context, output_dir, logger)
+
+                if (
+                    controls_enabled
+                    and next_controls_reminder is not None
+                    and now >= next_controls_reminder
+                ):
+                    _print_controls_help(question_interval_enabled, reminder=True)
+                    next_controls_reminder = now + CONTROL_REMINDER_SECONDS
+
                 time.sleep(0.1)
                 continue
 
@@ -359,6 +400,14 @@ def _run_live_session(
             if state.consume_snapshot_request():
                 _save_snapshot(context, output_dir, logger)
 
+            if (
+                controls_enabled
+                and next_controls_reminder is not None
+                and now >= next_controls_reminder
+            ):
+                _print_controls_help(question_interval_enabled, reminder=True)
+                next_controls_reminder = now + CONTROL_REMINDER_SECONDS
+
         for event in stt_engine.flush():
             if event.text.strip():
                 speaker_label: str | None = event.speaker
@@ -388,19 +437,14 @@ def _run_dry_session(
     main_prompt: str,
     question_interval: int,
     question_interval_enabled: bool,
+    controls_enabled: bool,
     output_dir: Path | None,
     start_time: float,
     max_runtime: int | None,
 ) -> None:
     print("Dry-run mode enabled. No real audio capture is used.")
-    print(
-        "Controls: p=pause/resume, m=mic on/off, i [sec]=ignore remote, "
-        "x <speaker>=ignore speaker, k=list speakers, g=generate now, s=snapshot, q=stop"
-    )
-    if question_interval_enabled:
-        print(f"Auto AI generation enabled every {question_interval}s.")
-    else:
-        print("Auto AI generation disabled. Use `g` to generate questions on demand.")
+    if controls_enabled:
+        _print_controls_help(question_interval_enabled)
 
     scripted = [
         ("remote", "SPEAKER_00", "Zacznijmy od celow projektu i zakresu MVP."),
@@ -412,6 +456,7 @@ def _run_dry_session(
     index = 0
     next_phrase_time = start_time
     next_question_time = start_time + question_interval if question_interval_enabled else None
+    next_controls_reminder = time.time() + CONTROL_REMINDER_SECONDS if controls_enabled else None
 
     while not state.should_stop():
         now = time.time()
@@ -425,6 +470,15 @@ def _run_dry_session(
                 _emit_questions(context, main_prompt, llm_client, logger)
             if state.consume_snapshot_request():
                 _save_snapshot(context, output_dir, logger)
+
+            if (
+                controls_enabled
+                and next_controls_reminder is not None
+                and now >= next_controls_reminder
+            ):
+                _print_controls_help(question_interval_enabled, reminder=True)
+                next_controls_reminder = now + CONTROL_REMINDER_SECONDS
+
             time.sleep(0.1)
             continue
 
@@ -453,6 +507,14 @@ def _run_dry_session(
 
         if state.consume_snapshot_request():
             _save_snapshot(context, output_dir, logger)
+
+        if (
+            controls_enabled
+            and next_controls_reminder is not None
+            and now >= next_controls_reminder
+        ):
+            _print_controls_help(question_interval_enabled, reminder=True)
+            next_controls_reminder = now + CONTROL_REMINDER_SECONDS
 
         time.sleep(0.05)
 
@@ -525,7 +587,7 @@ def _save_snapshot(
         logger.log("snapshot", {"path": str(snapshot_path)})
 
 
-def _start_controls_thread(state: RuntimeState) -> threading.Thread:
+def _start_controls_thread(state: RuntimeState, question_interval_enabled: bool) -> threading.Thread:
     def _loop() -> None:
         while not state.should_stop():
             try:
@@ -539,7 +601,9 @@ def _start_controls_thread(state: RuntimeState) -> threading.Thread:
             parts = raw.split()
             cmd = parts[0].lower()
 
-            if cmd == "p":
+            if cmd in {"h", "help", "?"}:
+                _print_controls_help(question_interval_enabled)
+            elif cmd == "p":
                 paused = state.toggle_pause()
                 print("Paused." if paused else "Resumed.")
             elif cmd == "m":
@@ -580,8 +644,133 @@ def _start_controls_thread(state: RuntimeState) -> threading.Thread:
                 state.request_stop()
                 print("Stop requested.")
             else:
-                print("Unknown command. Use: p, m, i [sec], x <speaker>, k, g, s, q")
+                print("Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, s, q")
 
     thread = threading.Thread(target=_loop, daemon=True)
     thread.start()
     return thread
+
+
+def _resolve_stt_backend_with_fallback(config: AppConfig) -> str:
+    backend = config.stt_backend.strip().lower()
+    if backend != "vosk":
+        return backend
+
+    if config.vosk_model_path.strip():
+        return "vosk"
+
+    whisper_model = config.whisper_cpp_model_path.strip()
+    if whisper_model:
+        print("VOSK model path is empty. Falling back to whisper_cpp backend.")
+        return "whisper_cpp"
+
+    raise RuntimeError(
+        "VOSK model path is empty and whisper_cpp model path is not configured. "
+        "Set at least one STT model path in settings."
+    )
+
+
+def _resolve_live_audio_sources(config: AppConfig, allow_prompt: bool) -> tuple[str, str]:
+    monitors = list_monitor_sources()
+    mics = list_mic_sources()
+
+    monitor_source = config.monitor_source.strip()
+    mic_source = config.mic_source.strip()
+
+    if monitor_source and monitor_source not in monitors:
+        print(f"Configured monitor source not found: {monitor_source}")
+        monitor_source = ""
+
+    if not monitor_source:
+        if not monitors:
+            raise RuntimeError(
+                "No monitor sources detected. Route meeting audio to a monitor source first (check pactl list short sources)."
+            )
+
+        if len(monitors) == 1:
+            monitor_source = monitors[0]
+            print(f"Auto-selected monitor source: {monitor_source}")
+        else:
+            default_monitor = choose_default_monitor_source(monitors)
+            if allow_prompt:
+                monitor_source = _prompt_select_source(
+                    "monitor",
+                    monitors,
+                    default_source=default_monitor,
+                    allow_skip=False,
+                )
+            else:
+                monitor_source = default_monitor or monitors[0]
+                print(f"Auto-selected monitor source: {monitor_source}")
+
+    if not config.mic_listening_enabled:
+        return monitor_source, ""
+
+    if mic_source and mic_source not in mics:
+        print(f"Configured mic source not found: {mic_source}")
+        mic_source = ""
+
+    if not mic_source:
+        if not mics:
+            print("No mic sources detected. Continuing with remote-only capture.")
+            return monitor_source, ""
+
+        if len(mics) == 1:
+            mic_source = mics[0]
+            print(f"Auto-selected mic source: {mic_source}")
+        else:
+            default_mic = choose_default_mic_source(mics)
+            if allow_prompt:
+                mic_source = _prompt_select_source(
+                    "microphone",
+                    mics,
+                    default_source=default_mic,
+                    allow_skip=True,
+                )
+            else:
+                mic_source = default_mic or mics[0]
+                print(f"Auto-selected mic source: {mic_source}")
+
+    return monitor_source, mic_source
+
+
+def _prompt_select_source(
+    kind: str,
+    sources: list[str],
+    default_source: str | None,
+    allow_skip: bool,
+) -> str:
+    print(f"Detected multiple {kind} sources:")
+    for index, source in enumerate(sources, start=1):
+        marker = " (default)" if source == default_source else ""
+        print(f"  {index}. {source}{marker}")
+
+    if allow_skip:
+        print("  0. Disable this source")
+
+    while True:
+        prompt = f"Select {kind} source"
+        if default_source:
+            prompt += f" [Enter={default_source}]"
+        prompt += ": "
+
+        raw = input(prompt).strip()
+        if not raw:
+            if default_source:
+                return default_source
+            if not allow_skip:
+                print("Selection required.")
+                continue
+            return ""
+
+        try:
+            selected = int(raw)
+        except ValueError:
+            print("Invalid selection. Enter a number.")
+            continue
+
+        if allow_skip and selected == 0:
+            return ""
+        if 1 <= selected <= len(sources):
+            return sources[selected - 1]
+        print("Selection out of range.")

@@ -10,6 +10,11 @@ It can:
 - ignore all remote audio for a period, or ignore selected speaker labels
 - run in modern TUI (`textual`) or legacy menu mode
 
+Audio source handling:
+- automatically detects available monitor and microphone sources
+- auto-selects a default source when one is available
+- shows an interactive numbered list when multiple sources are available
+
 ## Flow
 
 Default UI (`python3 -m power_ba.cli`) starts TUI.
@@ -32,6 +37,7 @@ Settings include:
 - diarization on/off + pyannote token/model
 
 Runtime controls during session:
+- `h` show commands help with descriptions
 - `p` pause/resume
 - `m` mic listening on/off
 - `i 30` ignore all remote audio for 30 seconds
@@ -40,6 +46,8 @@ Runtime controls during session:
 - `g` force immediate AI question generation (without waiting for interval)
 - `s` save context snapshot (if `--output` is set)
 - `q` stop session
+
+Controls help is printed at session start and reminded periodically during the session.
 
 ## Requirements (Linux)
 
@@ -65,6 +73,34 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+If you do not activate `.venv`, run commands with explicit interpreter:
+```bash
+.venv/bin/python -m power_ba.cli
+```
+
+## Global Install (Linux)
+
+Use installer script (recommended):
+```bash
+./install.sh
+```
+
+Then run from anywhere:
+```bash
+power-bi
+```
+
+Alternative with pipx:
+```bash
+pipx install .
+power-bi
+```
+
+To remove user installation:
+```bash
+./uninstall.sh
+```
+
 Optional diarization dependencies:
 ```bash
 pip install -r requirements-diarization.txt
@@ -75,6 +111,21 @@ pip install -r requirements-diarization.txt
 Default (TUI):
 ```bash
 python3 -m power_ba.cli
+```
+
+Global command (after installer):
+```bash
+power-bi
+```
+
+If you get `ModuleNotFoundError` (for example missing `typer`), use:
+```bash
+source .venv/bin/activate
+python3 -m power_ba.cli
+```
+or:
+```bash
+.venv/bin/python -m power_ba.cli
 ```
 
 Explicit TUI:
@@ -107,6 +158,10 @@ List available audio sources:
 python3 -m power_ba.cli list-sources
 ```
 
+When you start session and monitor/mic is not configured:
+- app auto-detects sources
+- if many are available, it asks you to choose from a numbered list
+
 Start with whisper.cpp backend:
 ```bash
 python3 -m power_ba.cli start \
@@ -120,6 +175,7 @@ python3 -m power_ba.cli start \
 - Audio files are written only when `--output <dir>` is set.
 - Without API keys, session still runs and AI output is disabled gracefully.
 - Diarization falls back to noop mode when pyannote/token is unavailable.
+- If `stt_backend=vosk` but `vosk_model_path` is empty, app automatically falls back to `whisper_cpp` when `whisper_cpp_model_path` is configured.
 
 ## Smoke Test
 
