@@ -83,6 +83,7 @@ If you do not activate `.venv`, run commands with explicit interpreter:
 Use installer script (recommended):
 ```bash
 ./install.sh
+source ~/.bashrc
 ```
 
 Then run from anywhere:
