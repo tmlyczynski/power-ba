@@ -1,45 +1,60 @@
-# Power BA CLI
+# Power BA
 
-CLI assistant for meetings that can:
-- capture mic + system audio (Meet/remote stream)
-- transcribe speech with local STT (VOSK)
-- generate follow-up questions every N seconds using OpenAI or Anthropic
-- run with interactive controls: pause/resume, mic on/off, ignore remote audio window
+Power BA is a Linux-first command line meeting assistant for developers and business analysts.
 
-## Main Flow
+It can:
+- capture system audio (`monitor`) and optionally microphone (`mic`)
+- transcribe with local STT (`vosk` or `whisper.cpp`)
+- generate follow-up questions every N seconds with OpenAI or Anthropic
+- pause/resume in runtime
+- ignore all remote audio for a period, or ignore selected speaker labels
+- run in modern TUI (`textual`) or legacy menu mode
 
-Interactive menu:
+## Flow
+
+Default UI (`python3 -m power_ba.cli`) starts TUI.
+
+Main options:
 1. Start transcription + AI questions
 2. Settings
 3. Exit
 
 Settings include:
-- OpenAI API key
-- Anthropic API key
-- provider and model switch (for example `gpt-5-mini` <-> Anthropic model)
+- OpenAI API key / Anthropic API key
+- provider/model switch
+- STT backend switch (`vosk` / `whisper_cpp`)
+- whisper.cpp model path and binary path
 - mic listening on/off
-- question interval (default 30s)
-- main prompt
-- mic source / monitor source
-- VOSK model path
+- auto interval on/off (can disable periodic generation completely)
+- question interval (default 30s, used when auto interval is on)
+- main prompt (role prompt)
+- mic and monitor source
+- diarization on/off + pyannote token/model
 
-Runtime controls while session is running:
-- `p` pause/resume processing
+Runtime controls during session:
+- `p` pause/resume
 - `m` mic listening on/off
-- `i 30` ignore remote audio for 30 seconds
-- `s` save context snapshot (only if output dir is set)
+- `i 30` ignore all remote audio for 30 seconds
+- `x SPEAKER_00` ignore/unignore specific speaker label
+- `k` list known and ignored speakers
+- `g` force immediate AI question generation (without waiting for interval)
+- `s` save context snapshot (if `--output` is set)
 - `q` stop session
 
 ## Requirements (Linux)
 
 - Python 3.10+
-- `pactl` and `parec` available (PulseAudio/PipeWire compatibility layer)
-- local VOSK model directory
+- `pactl` and `parec` (PulseAudio/PipeWire compatibility)
+- local model for selected STT backend
 
-Quick checks:
+Optional for diarization:
+- `pyannote.audio` dependencies + Hugging Face token
+
+Quick environment checks:
 ```bash
 pactl list short sources
 which parec
+which whisper-cli
 ```
 
 ## Install
@@ -50,16 +65,36 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Optional diarization dependencies:
+```bash
+pip install -r requirements-diarization.txt
+```
+
 ## Run
 
-Open menu (default flow):
+Default (TUI):
 ```bash
 python3 -m power_ba.cli
 ```
 
-Direct start command:
+Explicit TUI:
+```bash
+python3 -m power_ba.cli tui
+```
+
+Legacy menu:
+```bash
+python3 -m power_ba.cli menu
+```
+
+Direct start with 30s question interval:
 ```bash
 python3 -m power_ba.cli start --question-interval 30
+```
+
+Disable periodic generation and use only manual `g` trigger:
+```bash
+python3 -m power_ba.cli start --no-auto-interval
 ```
 
 Dry-run (no real audio capture):
@@ -67,21 +102,24 @@ Dry-run (no real audio capture):
 python3 -m power_ba.cli start --dry-run --question-interval 5 --max-runtime 15 --no-controls
 ```
 
-List audio sources:
+List available audio sources:
 ```bash
 python3 -m power_ba.cli list-sources
 ```
 
-## Configure Audio Sources
-
-In menu -> Settings choose `Mic source` and `Monitor source` from `pactl` list.
-Monitor source is usually something like `xxx.monitor`.
+Start with whisper.cpp backend:
+```bash
+python3 -m power_ba.cli start \
+	--stt-backend whisper_cpp \
+	--whisper-model-path /path/to/ggml-model.bin \
+	--whisper-binary whisper-cli
+```
 
 ## Notes
 
-- Audio files are saved only when `--output <dir>` is provided.
-- Without API key, AI generation is disabled gracefully (session still runs).
-- `whisper_cpp` backend is planned but not implemented in this scaffold.
+- Audio files are written only when `--output <dir>` is set.
+- Without API keys, session still runs and AI output is disabled gracefully.
+- Diarization falls back to noop mode when pyannote/token is unavailable.
 
 ## Smoke Test
 
@@ -89,7 +127,7 @@ Monitor source is usually something like `xxx.monitor`.
 python3 smoke_test.py
 ```
 
-This runs a 12-second simulated session and validates the runtime pipeline.
+This runs a short simulated session to validate runtime flow.
 
 ## Legal / Privacy
 

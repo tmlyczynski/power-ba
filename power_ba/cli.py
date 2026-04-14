@@ -16,7 +16,7 @@ app = typer.Typer(add_completion=False, no_args_is_help=False, help="Power BA me
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
-        _menu_loop(DEFAULT_CONFIG_PATH)
+        _default_ui(DEFAULT_CONFIG_PATH)
 
 
 @app.command()
@@ -25,6 +25,15 @@ def menu(
 ) -> None:
     """Open interactive menu."""
     _menu_loop(config_path)
+
+
+@app.command()
+def tui(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="Path to config YAML"),
+) -> None:
+    """Run modern TUI menu."""
+    if not _launch_tui_or_fallback(config_path):
+        _menu_loop(config_path)
 
 
 @app.command()
@@ -52,8 +61,13 @@ def list_sources() -> None:
 def start(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="Path to config YAML"),
     question_interval: int | None = typer.Option(None, "--question-interval", help="Seconds between AI question generation"),
+    auto_interval: bool | None = typer.Option(None, "--auto-interval/--no-auto-interval", help="Enable or disable automatic interval generation"),
     provider: str | None = typer.Option(None, "--provider", help="openai or anthropic"),
     model: str | None = typer.Option(None, "--model", help="LLM model name"),
+    stt_backend: str | None = typer.Option(None, "--stt-backend", help="vosk or whisper_cpp"),
+    whisper_model_path: str | None = typer.Option(None, "--whisper-model-path", help="Path to whisper.cpp model"),
+    whisper_binary: str | None = typer.Option(None, "--whisper-binary", help="whisper.cpp binary name/path"),
+    diarization: bool | None = typer.Option(None, "--diarization/--no-diarization", help="Enable or disable diarization"),
     mic_listening: bool | None = typer.Option(None, "--mic/--no-mic", help="Enable or disable microphone listening"),
     output: Path | None = typer.Option(None, "--output", help="Output directory for wav/jsonl logs"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run with simulated transcripts"),
@@ -66,10 +80,22 @@ def start(
 
     if question_interval is not None:
         runtime_config.question_interval_seconds = question_interval
+        if auto_interval is None and question_interval > 0:
+            runtime_config.question_interval_enabled = True
+    if auto_interval is not None:
+        runtime_config.question_interval_enabled = auto_interval
     if provider is not None:
         runtime_config.provider = provider.strip().lower()
     if model is not None and model.strip():
         runtime_config.model = model.strip()
+    if stt_backend is not None:
+        runtime_config.stt_backend = stt_backend.strip().lower()
+    if whisper_model_path is not None:
+        runtime_config.whisper_cpp_model_path = whisper_model_path.strip()
+    if whisper_binary is not None:
+        runtime_config.whisper_cpp_binary = whisper_binary.strip()
+    if diarization is not None:
+        runtime_config.diarization_enabled = diarization
     if mic_listening is not None:
         runtime_config.mic_listening_enabled = mic_listening
 
@@ -79,6 +105,7 @@ def start(
         run_session(
             config=runtime_config,
             question_interval_override=question_interval,
+            interval_enabled_override=auto_interval,
             output_dir=output,
             dry_run=dry_run,
             max_runtime=max_runtime,
@@ -86,6 +113,32 @@ def start(
         )
     except Exception as exc:  # pragma: no cover
         print(f"Session failed: {exc}")
+
+
+def _default_ui(config_path: Path) -> None:
+    if _launch_tui_or_fallback(config_path):
+        return
+    _menu_loop(config_path)
+
+
+def _launch_tui_or_fallback(config_path: Path) -> bool:
+    try:
+        from .tui import launch_tui
+    except Exception:
+        print("TUI unavailable, switching to legacy menu.")
+        return False
+
+    action = launch_tui(config_path)
+    if action != "start":
+        return True
+
+    config = load_config(config_path)
+    try:
+        run_session(config=config, interactive_controls=True)
+    except Exception as exc:  # pragma: no cover
+        print(f"Session failed: {exc}")
+
+    return True
 
 
 def _menu_loop(config_path: Path) -> None:
@@ -115,6 +168,7 @@ def _menu_loop(config_path: Path) -> None:
                 run_session(
                     config=runtime_config,
                     question_interval_override=interval_override,
+                    interval_enabled_override=True if interval_override is not None else None,
                     output_dir=output_dir,
                     dry_run=dry_run,
                     interactive_controls=True,
@@ -144,12 +198,21 @@ def _settings_loop(config: AppConfig, config_path: Path) -> AppConfig:
         print(f"4. Model                 [{working.model}]")
         print(f"5. Mic listening         [{'on' if working.mic_listening_enabled else 'off'}]")
         print(f"6. Question interval     [{working.question_interval_seconds}s]")
-        print(f"7. Main role prompt      [{working.main_prompt[:45]}...]")
-        print(f"8. Mic source            [{working.mic_source or 'not set'}]")
-        print(f"9. Monitor source        [{working.monitor_source or 'not set'}]")
-        print(f"10. VOSK model path      [{working.vosk_model_path or 'not set'}]")
-        print("11. Save and back")
-        print("12. Cancel and back")
+        print(f"7. Auto interval         [{'on' if working.question_interval_enabled else 'off'}]")
+        print(f"8. Main role prompt      [{working.main_prompt[:45]}...]")
+        print(f"9. Mic source            [{working.mic_source or 'not set'}]")
+        print(f"10. Monitor source        [{working.monitor_source or 'not set'}]")
+        print(f"11. STT backend          [{working.stt_backend}]")
+        print(f"12. VOSK model path      [{working.vosk_model_path or 'not set'}]")
+        print(f"13. whisper model path   [{working.whisper_cpp_model_path or 'not set'}]")
+        print(f"14. whisper binary       [{working.whisper_cpp_binary}]")
+        print(f"15. whisper chunk sec    [{working.whisper_cpp_chunk_seconds}s]")
+        print(f"16. Diarization          [{'on' if working.diarization_enabled else 'off'}]")
+        print(f"17. pyannote token       [{'set' if working.pyannote_hf_token else 'empty'}]")
+        print(f"18. pyannote model       [{working.pyannote_model_name}]")
+        print(f"19. diarization interval [{working.diarization_interval_seconds}s]")
+        print("20. Save and back")
+        print("21. Cancel and back")
 
         choice = input("Select setting: ").strip()
 
@@ -176,25 +239,57 @@ def _settings_loop(config: AppConfig, config_path: Path) -> AppConfig:
             if val is not None:
                 working.question_interval_seconds = val
         elif choice == "7":
+            working.question_interval_enabled = not working.question_interval_enabled
+        elif choice == "8":
             prompt = input("Main role prompt: ").strip()
             if prompt:
                 working.main_prompt = prompt
-        elif choice == "8":
+        elif choice == "9":
             selected = _select_source("mic", working.mic_source)
             if selected is not None:
                 working.mic_source = selected
-        elif choice == "9":
+        elif choice == "10":
             selected = _select_source("monitor", working.monitor_source)
             if selected is not None:
                 working.monitor_source = selected
-        elif choice == "10":
+        elif choice == "11":
+            backend = input("STT backend [vosk/whisper_cpp]: ").strip().lower()
+            if backend in {"vosk", "whisper_cpp"}:
+                working.stt_backend = backend
+            else:
+                print("Unsupported STT backend.")
+        elif choice == "12":
             model_path = input("VOSK model path: ").strip()
             working.vosk_model_path = model_path
-        elif choice == "11":
+        elif choice == "13":
+            model_path = input("whisper.cpp model path: ").strip()
+            working.whisper_cpp_model_path = model_path
+        elif choice == "14":
+            binary = input("whisper.cpp binary (default whisper-cli): ").strip()
+            if binary:
+                working.whisper_cpp_binary = binary
+        elif choice == "15":
+            val = _ask_optional_int("whisper.cpp chunk seconds: ")
+            if val is not None:
+                working.whisper_cpp_chunk_seconds = val
+        elif choice == "16":
+            working.diarization_enabled = not working.diarization_enabled
+        elif choice == "17":
+            token = getpass.getpass("pyannote HF token (blank clears): ").strip()
+            working.pyannote_hf_token = token
+        elif choice == "18":
+            name = input("pyannote model name: ").strip()
+            if name:
+                working.pyannote_model_name = name
+        elif choice == "19":
+            val = _ask_optional_int("Diarization interval in seconds: ")
+            if val is not None:
+                working.diarization_interval_seconds = val
+        elif choice == "20":
             saved_path = save_config(working, config_path)
             print(f"Config saved: {saved_path}")
             return working
-        elif choice == "12":
+        elif choice == "21":
             print("Canceled settings changes.")
             return config
         else:

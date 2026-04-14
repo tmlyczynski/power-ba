@@ -10,6 +10,7 @@ from pathlib import Path
 from .capture import PulseAudioCapture
 from .config import AppConfig
 from .context import ConversationContext
+from .diarization import BaseSpeakerDiarizer, build_speaker_diarizer
 from .llm import LlmClient, build_llm_client
 from .stt import SttEngineError, build_stt_engine
 
@@ -21,6 +22,9 @@ class RuntimeState:
     ignore_remote_until: float = 0.0
     stop_requested: bool = False
     snapshot_requested: bool = False
+    force_generation_requested: bool = False
+    ignored_speakers: set[str] = field(default_factory=set)
+    known_speakers: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def toggle_pause(self) -> bool:
@@ -70,6 +74,51 @@ class RuntimeState:
                 return True
             return False
 
+    def request_force_generation(self) -> None:
+        with self._lock:
+            self.force_generation_requested = True
+
+    def consume_force_generation_request(self) -> bool:
+        with self._lock:
+            if self.force_generation_requested:
+                self.force_generation_requested = False
+                return True
+            return False
+
+    def register_speaker(self, speaker: str) -> None:
+        cleaned = speaker.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self.known_speakers.add(cleaned)
+
+    def toggle_ignore_speaker(self, speaker: str) -> bool:
+        cleaned = speaker.strip()
+        if not cleaned:
+            return False
+
+        with self._lock:
+            if cleaned in self.ignored_speakers:
+                self.ignored_speakers.remove(cleaned)
+                return False
+
+            self.ignored_speakers.add(cleaned)
+            return True
+
+    def is_speaker_ignored(self, speaker: str | None) -> bool:
+        if not speaker:
+            return False
+        with self._lock:
+            return speaker in self.ignored_speakers
+
+    def list_known_speakers(self) -> list[str]:
+        with self._lock:
+            return sorted(self.known_speakers)
+
+    def list_ignored_speakers(self) -> list[str]:
+        with self._lock:
+            return sorted(self.ignored_speakers)
+
 
 class JsonlLogger:
     def __init__(self, path: Path) -> None:
@@ -97,6 +146,7 @@ class JsonlLogger:
 def run_session(
     config: AppConfig,
     question_interval_override: int | None = None,
+    interval_enabled_override: bool | None = None,
     output_dir: Path | None = None,
     dry_run: bool = False,
     max_runtime: int | None = None,
@@ -104,17 +154,37 @@ def run_session(
 ) -> None:
     config.sanitize()
 
-    question_interval = question_interval_override or config.question_interval_seconds
+    question_interval_enabled = config.question_interval_enabled
+    if interval_enabled_override is not None:
+        question_interval_enabled = interval_enabled_override
+
+    question_interval = config.question_interval_seconds
+    if question_interval_override is not None:
+        if question_interval_override <= 0:
+            question_interval_enabled = False
+        else:
+            question_interval = question_interval_override
+
     if question_interval < 5:
         question_interval = 5
 
     state = RuntimeState(mic_enabled=config.mic_listening_enabled)
-    context = ConversationContext(window_seconds=max(config.context_window_seconds, question_interval))
+    required_window = question_interval if question_interval_enabled else 60
+    context = ConversationContext(window_seconds=max(config.context_window_seconds, required_window))
     llm_client = build_llm_client(
         provider=config.provider,
         model=config.model,
         openai_api_key=config.openai_api_key,
         anthropic_api_key=config.anthropic_api_key,
+    )
+    diarizer = build_speaker_diarizer(
+        enabled=config.diarization_enabled,
+        backend=config.diarization_backend,
+        hf_token=config.pyannote_hf_token,
+        model_name=config.pyannote_model_name,
+        sample_rate=16000,
+        interval_seconds=config.diarization_interval_seconds,
+        max_buffer_seconds=config.diarization_max_buffer_seconds,
     )
 
     logger: JsonlLogger | None = None
@@ -125,13 +195,15 @@ def run_session(
         logger = JsonlLogger(out_dir / "session.jsonl")
 
     print("Consent reminder: use this app only when participants consent to recording/transcription.")
+    if diarizer.status_message:
+        print(f"Diarization: {diarizer.status_message}")
     if interactive_controls and sys.stdin.isatty():
         _start_controls_thread(state)
     else:
         print("Interactive controls disabled. Use CLI flags to control runtime.")
 
     start_time = time.time()
-    next_question_time = start_time + question_interval
+    next_question_time = start_time + question_interval if question_interval_enabled else None
 
     try:
         if dry_run:
@@ -142,6 +214,7 @@ def run_session(
                 logger=logger,
                 main_prompt=config.main_prompt,
                 question_interval=question_interval,
+                question_interval_enabled=question_interval_enabled,
                 output_dir=out_dir,
                 start_time=start_time,
                 max_runtime=max_runtime,
@@ -151,10 +224,12 @@ def run_session(
                 config=config,
                 state=state,
                 context=context,
+                diarizer=diarizer,
                 llm_client=llm_client,
                 logger=logger,
                 main_prompt=config.main_prompt,
                 question_interval=question_interval,
+                question_interval_enabled=question_interval_enabled,
                 output_dir=out_dir,
                 start_time=start_time,
                 next_question_time=next_question_time,
@@ -171,13 +246,15 @@ def _run_live_session(
     config: AppConfig,
     state: RuntimeState,
     context: ConversationContext,
+    diarizer: BaseSpeakerDiarizer,
     llm_client: LlmClient,
     logger: JsonlLogger | None,
     main_prompt: str,
     question_interval: int,
+    question_interval_enabled: bool,
     output_dir: Path | None,
     start_time: float,
-    next_question_time: float,
+    next_question_time: float | None,
     max_runtime: int | None,
 ) -> None:
     if not config.monitor_source:
@@ -200,12 +277,23 @@ def _run_live_session(
             backend=config.stt_backend,
             vosk_model_path=config.vosk_model_path,
             sample_rate=16000,
+            whisper_cpp_model_path=config.whisper_cpp_model_path,
+            whisper_cpp_binary=config.whisper_cpp_binary,
+            whisper_cpp_chunk_seconds=config.whisper_cpp_chunk_seconds,
+            whisper_cpp_language=config.whisper_cpp_language,
         )
     except SttEngineError as exc:
         raise RuntimeError(str(exc)) from exc
 
     capture.start(output_dir=output_dir)
-    print("Capture started. Controls: p=pause/resume, m=mic on/off, i [sec]=ignore remote, s=snapshot, q=stop")
+    print(
+        "Capture started. Controls: p=pause/resume, m=mic on/off, i [sec]=ignore remote, "
+        "x <speaker>=ignore speaker, k=list speakers, g=generate now, s=snapshot, q=stop"
+    )
+    if question_interval_enabled:
+        print(f"Auto AI generation enabled every {question_interval}s.")
+    else:
+        print("Auto AI generation disabled. Use `g` to generate questions on demand.")
 
     try:
         while not state.should_stop():
@@ -215,6 +303,8 @@ def _run_live_session(
                 continue
 
             if state.is_paused():
+                if state.consume_force_generation_request():
+                    _emit_questions(context, main_prompt, llm_client, logger)
                 if state.consume_snapshot_request():
                     _save_snapshot(context, output_dir, logger)
                 time.sleep(0.1)
@@ -227,6 +317,12 @@ def _run_live_session(
                 elif chunk.source == "remote" and state.should_ignore_remote(now):
                     pass
                 else:
+                    if chunk.source == "remote":
+                        diarizer.add_audio(chunk.data, chunk.timestamp)
+                        diarizer.run_if_due(now)
+                        for speaker in diarizer.known_speakers():
+                            state.register_speaker(speaker)
+
                     events = stt_engine.accept_audio(
                         source=chunk.source,
                         audio_chunk=chunk.data,
@@ -235,10 +331,28 @@ def _run_live_session(
                     for event in events:
                         if not event.is_final:
                             continue
-                        _handle_transcript(event.source, event.text, context, logger)
+
+                        speaker_label: str | None = event.speaker
+                        if event.source == "remote":
+                            speaker_label = speaker_label or diarizer.label_for_timestamp(event.timestamp)
+                            if speaker_label:
+                                state.register_speaker(speaker_label)
+                            if state.is_speaker_ignored(speaker_label):
+                                continue
+
+                        _handle_transcript(
+                            event.source,
+                            event.text,
+                            context,
+                            logger,
+                            speaker_label=speaker_label,
+                        )
+
+            if state.consume_force_generation_request():
+                _emit_questions(context, main_prompt, llm_client, logger)
 
             now = time.time()
-            if now >= next_question_time:
+            if question_interval_enabled and next_question_time is not None and now >= next_question_time:
                 _emit_questions(context, main_prompt, llm_client, logger)
                 next_question_time = now + question_interval
 
@@ -247,7 +361,21 @@ def _run_live_session(
 
         for event in stt_engine.flush():
             if event.text.strip():
-                _handle_transcript(event.source, event.text, context, logger)
+                speaker_label: str | None = event.speaker
+                if event.source == "remote":
+                    speaker_label = speaker_label or diarizer.label_for_timestamp(event.timestamp)
+                    if speaker_label:
+                        state.register_speaker(speaker_label)
+                    if state.is_speaker_ignored(speaker_label):
+                        continue
+
+                _handle_transcript(
+                    event.source,
+                    event.text,
+                    context,
+                    logger,
+                    speaker_label=speaker_label,
+                )
     finally:
         capture.stop()
 
@@ -259,23 +387,31 @@ def _run_dry_session(
     logger: JsonlLogger | None,
     main_prompt: str,
     question_interval: int,
+    question_interval_enabled: bool,
     output_dir: Path | None,
     start_time: float,
     max_runtime: int | None,
 ) -> None:
     print("Dry-run mode enabled. No real audio capture is used.")
-    print("Controls: p=pause/resume, m=mic on/off, i [sec]=ignore remote, s=snapshot, q=stop")
+    print(
+        "Controls: p=pause/resume, m=mic on/off, i [sec]=ignore remote, "
+        "x <speaker>=ignore speaker, k=list speakers, g=generate now, s=snapshot, q=stop"
+    )
+    if question_interval_enabled:
+        print(f"Auto AI generation enabled every {question_interval}s.")
+    else:
+        print("Auto AI generation disabled. Use `g` to generate questions on demand.")
 
     scripted = [
-        ("remote", "Zacznijmy od celow projektu i zakresu MVP."),
-        ("mic", "Mamy ograniczony budzet i dwa sprinty na wdrozenie."),
-        ("remote", "Najwieksze ryzyko to opoznione integracje API partnera."),
-        ("mic", "Potrzebujemy tez metryk sukcesu i planu rolloutu."),
+        ("remote", "SPEAKER_00", "Zacznijmy od celow projektu i zakresu MVP."),
+        ("mic", None, "Mamy ograniczony budzet i dwa sprinty na wdrozenie."),
+        ("remote", "SPEAKER_01", "Najwieksze ryzyko to opoznione integracje API partnera."),
+        ("mic", None, "Potrzebujemy tez metryk sukcesu i planu rolloutu."),
     ]
 
     index = 0
     next_phrase_time = start_time
-    next_question_time = start_time + question_interval
+    next_question_time = start_time + question_interval if question_interval_enabled else None
 
     while not state.should_stop():
         now = time.time()
@@ -285,13 +421,15 @@ def _run_dry_session(
             continue
 
         if state.is_paused():
+            if state.consume_force_generation_request():
+                _emit_questions(context, main_prompt, llm_client, logger)
             if state.consume_snapshot_request():
                 _save_snapshot(context, output_dir, logger)
             time.sleep(0.1)
             continue
 
         if now >= next_phrase_time:
-            source, text = scripted[index % len(scripted)]
+            source, speaker_label, text = scripted[index % len(scripted)]
             index += 1
             next_phrase_time = now + 2.0
 
@@ -299,10 +437,17 @@ def _run_dry_session(
                 pass
             elif source == "remote" and state.should_ignore_remote(now):
                 pass
+            elif source == "remote" and state.is_speaker_ignored(speaker_label):
+                pass
             else:
-                _handle_transcript(source, text, context, logger)
+                if speaker_label:
+                    state.register_speaker(speaker_label)
+                _handle_transcript(source, text, context, logger, speaker_label=speaker_label)
 
-        if now >= next_question_time:
+        if state.consume_force_generation_request():
+            _emit_questions(context, main_prompt, llm_client, logger)
+
+        if question_interval_enabled and next_question_time is not None and now >= next_question_time:
             _emit_questions(context, main_prompt, llm_client, logger)
             next_question_time = now + question_interval
 
@@ -317,18 +462,31 @@ def _handle_transcript(
     text: str,
     context: ConversationContext,
     logger: JsonlLogger | None,
+    speaker_label: str | None = None,
 ) -> None:
     cleaned = text.strip()
     if not cleaned:
         return
 
     stamp = time.strftime("%H:%M:%S")
-    label = "JA" if source == "mic" else "MEET"
+    if source == "mic":
+        label = "JA"
+    elif speaker_label:
+        label = f"MEET:{speaker_label}"
+    else:
+        label = "MEET"
     print(f"[{stamp}] [{label}] {cleaned}")
 
-    context.add_line(source=source, text=cleaned)
+    context.add_line(source=source, text=cleaned, speaker=speaker_label)
     if logger is not None:
-        logger.log("transcript", {"source": source, "text": cleaned})
+        logger.log(
+            "transcript",
+            {
+                "source": source,
+                "speaker": speaker_label,
+                "text": cleaned,
+            },
+        )
 
 
 def _emit_questions(
@@ -396,6 +554,25 @@ def _start_controls_thread(state: RuntimeState) -> threading.Thread:
                         seconds = 30
                 until = state.set_ignore_remote_for(seconds)
                 print(f"Ignoring remote audio until {time.strftime('%H:%M:%S', time.localtime(until))}.")
+            elif cmd == "x":
+                if len(parts) < 2:
+                    print("Usage: x <speaker_id>")
+                    continue
+
+                speaker_id = parts[1].strip()
+                enabled = state.toggle_ignore_speaker(speaker_id)
+                if enabled:
+                    print(f"Speaker ignored: {speaker_id}")
+                else:
+                    print(f"Speaker unignored: {speaker_id}")
+            elif cmd == "k":
+                known = state.list_known_speakers()
+                ignored = state.list_ignored_speakers()
+                print("Known speakers: " + (", ".join(known) if known else "none"))
+                print("Ignored speakers: " + (", ".join(ignored) if ignored else "none"))
+            elif cmd == "g":
+                state.request_force_generation()
+                print("Manual AI generation requested.")
             elif cmd == "s":
                 state.request_snapshot()
                 print("Snapshot requested.")
@@ -403,7 +580,7 @@ def _start_controls_thread(state: RuntimeState) -> threading.Thread:
                 state.request_stop()
                 print("Stop requested.")
             else:
-                print("Unknown command. Use: p, m, i [sec], s, q")
+                print("Unknown command. Use: p, m, i [sec], x <speaker>, k, g, s, q")
 
     thread = threading.Thread(target=_loop, daemon=True)
     thread.start()

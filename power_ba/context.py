@@ -9,6 +9,7 @@ from time import time
 class TranscriptLine:
     timestamp: float
     source: str
+    speaker: str | None
     text: str
 
 
@@ -17,12 +18,18 @@ class ConversationContext:
         self.window_seconds = window_seconds
         self._lines: deque[TranscriptLine] = deque()
 
-    def add_line(self, source: str, text: str, timestamp: float | None = None) -> None:
+    def add_line(
+        self,
+        source: str,
+        text: str,
+        timestamp: float | None = None,
+        speaker: str | None = None,
+    ) -> None:
         ts = timestamp or time()
         cleaned = text.strip()
         if not cleaned:
             return
-        self._lines.append(TranscriptLine(timestamp=ts, source=source, text=cleaned))
+        self._lines.append(TranscriptLine(timestamp=ts, source=source, speaker=speaker, text=cleaned))
         self._prune(now=ts)
 
     def recent_lines(self, now: float | None = None) -> list[TranscriptLine]:
@@ -39,7 +46,12 @@ class ConversationContext:
 
         transcript_lines = []
         for line in lines:
-            label = "JA" if line.source == "mic" else "MEET"
+            if line.source == "mic":
+                label = "JA"
+            elif line.speaker:
+                label = f"MEET:{line.speaker}"
+            else:
+                label = "MEET"
             transcript_lines.append(f"[{label}] {line.text}")
 
         transcript = "\n".join(transcript_lines)
