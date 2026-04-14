@@ -34,6 +34,7 @@ Settings include:
 - question interval (default 30s, used when auto interval is on)
 - main prompt (role prompt)
 - mic and monitor source
+- mic and monitor source picker from detected list (in TUI Settings)
 - diarization on/off + pyannote token/model
 
 Runtime controls during session:
@@ -44,8 +45,12 @@ Runtime controls during session:
 - `x SPEAKER_00` ignore/unignore specific speaker label
 - `k` list known and ignored speakers
 - `g` force immediate AI question generation (without waiting for interval)
+- `a <text>` send a custom AI request (refine or ask a new follow-up)
 - `s` save context snapshot (if `--output` is set)
 - `q` stop session
+
+In TUI session view, commands with descriptions are always visible above the log,
+and there is a command input bar at the bottom.
 
 Controls help is printed at session start and reminded periodically during the session.
 

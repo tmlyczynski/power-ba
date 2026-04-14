@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .capture import (
     PulseAudioCapture,
@@ -21,6 +23,15 @@ from .llm import LlmClient, build_llm_client
 from .stt import SttEngineError, build_stt_engine
 
 CONTROL_REMINDER_SECONDS = 30.0
+OutputEmitter = Callable[[str], None]
+
+
+def _default_emit(message: str) -> None:
+    print(message)
+
+
+def _emit(emit: OutputEmitter, message: str) -> None:
+    emit(message)
 
 
 @dataclass
@@ -31,6 +42,7 @@ class RuntimeState:
     stop_requested: bool = False
     snapshot_requested: bool = False
     force_generation_requested: bool = False
+    custom_query_requests: list[str] = field(default_factory=list)
     ignored_speakers: set[str] = field(default_factory=set)
     known_speakers: set[str] = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -93,6 +105,24 @@ class RuntimeState:
                 return True
             return False
 
+    def request_custom_query(self, query: str) -> bool:
+        cleaned = query.strip()
+        if not cleaned:
+            return False
+
+        with self._lock:
+            self.custom_query_requests.append(cleaned)
+        return True
+
+    def consume_custom_query_requests(self) -> list[str]:
+        with self._lock:
+            if not self.custom_query_requests:
+                return []
+
+            pending = list(self.custom_query_requests)
+            self.custom_query_requests.clear()
+            return pending
+
     def register_speaker(self, speaker: str) -> None:
         cleaned = speaker.strip()
         if not cleaned:
@@ -151,26 +181,31 @@ class JsonlLogger:
             self._file.close()
 
 
-def _print_controls_help(question_interval_enabled: bool, reminder: bool = False) -> None:
+def _print_controls_help(
+    question_interval_enabled: bool,
+    emit: OutputEmitter,
+    reminder: bool = False,
+) -> None:
     if reminder:
-        print("\n=== Controls reminder ===")
+        _emit(emit, "\n=== Controls reminder ===")
     else:
-        print("\n=== Session controls ===")
+        _emit(emit, "\n=== Session controls ===")
 
-    print("  p          pause or resume processing (STT + AI)")
-    print("  m          toggle microphone listening on/off")
-    print("  i <sec>    ignore all remote audio for N seconds")
-    print("  x <id>     ignore/unignore selected remote speaker id")
-    print("  k          show known speakers and ignored speakers")
-    print("  g          generate AI questions now (manual trigger)")
-    print("  s          save text snapshot (requires --output)")
-    print("  h          show this help again")
-    print("  q          stop current session")
+    _emit(emit, "  p          pause or resume processing (STT + AI)")
+    _emit(emit, "  m          toggle microphone listening on/off")
+    _emit(emit, "  i <sec>    ignore all remote audio for N seconds")
+    _emit(emit, "  x <id>     ignore/unignore selected remote speaker id")
+    _emit(emit, "  k          show known speakers and ignored speakers")
+    _emit(emit, "  g          generate AI questions now (manual trigger)")
+    _emit(emit, "  a <text>   send custom AI query / refine follow-up")
+    _emit(emit, "  s          save text snapshot (requires --output)")
+    _emit(emit, "  h          show this help again")
+    _emit(emit, "  q          stop current session")
 
     if question_interval_enabled:
-        print("Auto AI generation is ON (periodic interval).")
+        _emit(emit, "Auto AI generation is ON (periodic interval).")
     else:
-        print("Auto AI generation is OFF. Use `g` to generate on demand.")
+        _emit(emit, "Auto AI generation is OFF. Use `g` to generate on demand.")
 
 
 def run_session(
@@ -181,8 +216,11 @@ def run_session(
     dry_run: bool = False,
     max_runtime: int | None = None,
     interactive_controls: bool = True,
+    command_queue: queue.Queue[str] | None = None,
+    event_callback: OutputEmitter | None = None,
 ) -> None:
     config.sanitize()
+    emit = event_callback or _default_emit
 
     question_interval_enabled = config.question_interval_enabled
     if interval_enabled_override is not None:
@@ -224,14 +262,24 @@ def run_session(
         out_dir.mkdir(parents=True, exist_ok=True)
         logger = JsonlLogger(out_dir / "session.jsonl")
 
-    print("Consent reminder: use this app only when participants consent to recording/transcription.")
+    _emit(emit, "Consent reminder: use this app only when participants consent to recording/transcription.")
     if diarizer.status_message:
-        print(f"Diarization: {diarizer.status_message}")
-    controls_enabled = interactive_controls and sys.stdin.isatty()
-    if controls_enabled:
-        _start_controls_thread(state, question_interval_enabled=question_interval_enabled)
-    else:
-        print("Interactive controls disabled. Use CLI flags to control runtime.")
+        _emit(emit, f"Diarization: {diarizer.status_message}")
+
+    controls_enabled = False
+    if interactive_controls:
+        if command_queue is not None:
+            controls_enabled = True
+        elif sys.stdin.isatty():
+            controls_enabled = True
+            _start_controls_thread(
+                state,
+                question_interval_enabled=question_interval_enabled,
+                emit=emit,
+            )
+
+    if not controls_enabled:
+        _emit(emit, "Interactive controls disabled. Use CLI flags to control runtime.")
 
     start_time = time.time()
     next_question_time = start_time + question_interval if question_interval_enabled else None
@@ -250,6 +298,8 @@ def run_session(
                 output_dir=out_dir,
                 start_time=start_time,
                 max_runtime=max_runtime,
+                command_queue=command_queue,
+                emit=emit,
             )
         else:
             _run_live_session(
@@ -267,12 +317,14 @@ def run_session(
                 start_time=start_time,
                 next_question_time=next_question_time,
                 max_runtime=max_runtime,
+                command_queue=command_queue,
+                emit=emit,
             )
     finally:
         if logger is not None:
             logger.close()
 
-    print("Session stopped.")
+    _emit(emit, "Session stopped.")
 
 
 def _run_live_session(
@@ -290,11 +342,13 @@ def _run_live_session(
     start_time: float,
     next_question_time: float | None,
     max_runtime: int | None,
+    command_queue: queue.Queue[str] | None,
+    emit: OutputEmitter,
 ) -> None:
     allow_prompt = sys.stdin.isatty()
-    monitor_source, mic_source = _resolve_live_audio_sources(config, allow_prompt=allow_prompt)
+    monitor_source, mic_source = _resolve_live_audio_sources(config, allow_prompt=allow_prompt, emit=emit)
     if config.mic_listening_enabled and not mic_source:
-        print("Mic listening enabled but no mic selected. Continuing with remote-only capture.")
+        _emit(emit, "Mic listening enabled but no mic selected. Continuing with remote-only capture.")
 
     capture = PulseAudioCapture(
         mic_source=mic_source,
@@ -305,7 +359,7 @@ def _run_live_session(
         is_source_enabled=lambda source: state.is_mic_enabled() if source == "mic" else True,
     )
 
-    stt_backend = _resolve_stt_backend_with_fallback(config)
+    stt_backend = _resolve_stt_backend_with_fallback(config, emit=emit)
 
     try:
         stt_engine = build_stt_engine(
@@ -321,31 +375,46 @@ def _run_live_session(
         raise RuntimeError(str(exc)) from exc
 
     capture.start(output_dir=output_dir)
-    print("Capture started.")
+    _emit(emit, "Capture started.")
     if controls_enabled:
-        _print_controls_help(question_interval_enabled)
+        _print_controls_help(question_interval_enabled, emit=emit)
 
     next_controls_reminder = time.time() + CONTROL_REMINDER_SECONDS if controls_enabled else None
 
     try:
         while not state.should_stop():
             now = time.time()
+            _drain_command_queue(
+                command_queue=command_queue,
+                state=state,
+                question_interval_enabled=question_interval_enabled,
+                emit=emit,
+            )
+            _drain_custom_query_requests(
+                state=state,
+                context=context,
+                main_prompt=main_prompt,
+                llm_client=llm_client,
+                logger=logger,
+                emit=emit,
+            )
+
             if max_runtime is not None and now - start_time >= max_runtime:
                 state.request_stop()
                 continue
 
             if state.is_paused():
                 if state.consume_force_generation_request():
-                    _emit_questions(context, main_prompt, llm_client, logger)
+                    _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
                 if state.consume_snapshot_request():
-                    _save_snapshot(context, output_dir, logger)
+                    _save_snapshot(context, output_dir, logger, emit=emit)
 
                 if (
                     controls_enabled
                     and next_controls_reminder is not None
                     and now >= next_controls_reminder
                 ):
-                    _print_controls_help(question_interval_enabled, reminder=True)
+                    _print_controls_help(question_interval_enabled, emit=emit, reminder=True)
                     next_controls_reminder = now + CONTROL_REMINDER_SECONDS
 
                 time.sleep(0.1)
@@ -387,25 +456,26 @@ def _run_live_session(
                             context,
                             logger,
                             speaker_label=speaker_label,
+                            emit=emit,
                         )
 
             if state.consume_force_generation_request():
-                _emit_questions(context, main_prompt, llm_client, logger)
+                _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
 
             now = time.time()
             if question_interval_enabled and next_question_time is not None and now >= next_question_time:
-                _emit_questions(context, main_prompt, llm_client, logger)
+                _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
                 next_question_time = now + question_interval
 
             if state.consume_snapshot_request():
-                _save_snapshot(context, output_dir, logger)
+                _save_snapshot(context, output_dir, logger, emit=emit)
 
             if (
                 controls_enabled
                 and next_controls_reminder is not None
                 and now >= next_controls_reminder
             ):
-                _print_controls_help(question_interval_enabled, reminder=True)
+                _print_controls_help(question_interval_enabled, emit=emit, reminder=True)
                 next_controls_reminder = now + CONTROL_REMINDER_SECONDS
 
         for event in stt_engine.flush():
@@ -424,6 +494,7 @@ def _run_live_session(
                     context,
                     logger,
                     speaker_label=speaker_label,
+                    emit=emit,
                 )
     finally:
         capture.stop()
@@ -441,10 +512,12 @@ def _run_dry_session(
     output_dir: Path | None,
     start_time: float,
     max_runtime: int | None,
+    command_queue: queue.Queue[str] | None,
+    emit: OutputEmitter,
 ) -> None:
-    print("Dry-run mode enabled. No real audio capture is used.")
+    _emit(emit, "Dry-run mode enabled. No real audio capture is used.")
     if controls_enabled:
-        _print_controls_help(question_interval_enabled)
+        _print_controls_help(question_interval_enabled, emit=emit)
 
     scripted = [
         ("remote", "SPEAKER_00", "Zacznijmy od celow projektu i zakresu MVP."),
@@ -461,22 +534,37 @@ def _run_dry_session(
     while not state.should_stop():
         now = time.time()
 
+        _drain_command_queue(
+            command_queue=command_queue,
+            state=state,
+            question_interval_enabled=question_interval_enabled,
+            emit=emit,
+        )
+        _drain_custom_query_requests(
+            state=state,
+            context=context,
+            main_prompt=main_prompt,
+            llm_client=llm_client,
+            logger=logger,
+            emit=emit,
+        )
+
         if max_runtime is not None and now - start_time >= max_runtime:
             state.request_stop()
             continue
 
         if state.is_paused():
             if state.consume_force_generation_request():
-                _emit_questions(context, main_prompt, llm_client, logger)
+                _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
             if state.consume_snapshot_request():
-                _save_snapshot(context, output_dir, logger)
+                _save_snapshot(context, output_dir, logger, emit=emit)
 
             if (
                 controls_enabled
                 and next_controls_reminder is not None
                 and now >= next_controls_reminder
             ):
-                _print_controls_help(question_interval_enabled, reminder=True)
+                _print_controls_help(question_interval_enabled, emit=emit, reminder=True)
                 next_controls_reminder = now + CONTROL_REMINDER_SECONDS
 
             time.sleep(0.1)
@@ -496,24 +584,24 @@ def _run_dry_session(
             else:
                 if speaker_label:
                     state.register_speaker(speaker_label)
-                _handle_transcript(source, text, context, logger, speaker_label=speaker_label)
+                _handle_transcript(source, text, context, logger, speaker_label=speaker_label, emit=emit)
 
         if state.consume_force_generation_request():
-            _emit_questions(context, main_prompt, llm_client, logger)
+            _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
 
         if question_interval_enabled and next_question_time is not None and now >= next_question_time:
-            _emit_questions(context, main_prompt, llm_client, logger)
+            _emit_questions(context, main_prompt, llm_client, logger, emit=emit)
             next_question_time = now + question_interval
 
         if state.consume_snapshot_request():
-            _save_snapshot(context, output_dir, logger)
+            _save_snapshot(context, output_dir, logger, emit=emit)
 
         if (
             controls_enabled
             and next_controls_reminder is not None
             and now >= next_controls_reminder
         ):
-            _print_controls_help(question_interval_enabled, reminder=True)
+            _print_controls_help(question_interval_enabled, emit=emit, reminder=True)
             next_controls_reminder = now + CONTROL_REMINDER_SECONDS
 
         time.sleep(0.05)
@@ -525,6 +613,7 @@ def _handle_transcript(
     context: ConversationContext,
     logger: JsonlLogger | None,
     speaker_label: str | None = None,
+    emit: OutputEmitter = _default_emit,
 ) -> None:
     cleaned = text.strip()
     if not cleaned:
@@ -537,7 +626,7 @@ def _handle_transcript(
         label = f"MEET:{speaker_label}"
     else:
         label = "MEET"
-    print(f"[{stamp}] [{label}] {cleaned}")
+    _emit(emit, f"[{stamp}] [{label}] {cleaned}")
 
     context.add_line(source=source, text=cleaned, speaker=speaker_label)
     if logger is not None:
@@ -556,102 +645,210 @@ def _emit_questions(
     main_prompt: str,
     llm_client: LlmClient,
     logger: JsonlLogger | None,
+    emit: OutputEmitter,
 ) -> None:
     payload = context.render_for_prompt(main_prompt=main_prompt)
     if not payload:
-        print("[AI] Waiting for more conversation context.")
+        _emit(emit, "[AI] Waiting for more conversation context.")
         return
 
     answer = llm_client.generate_questions(payload)
-    print("\n[AI QUESTIONS]\n" + answer + "\n")
+    _emit(emit, "\n[AI QUESTIONS]\n" + answer + "\n")
 
     if logger is not None:
         logger.log("ai_questions", {"text": answer})
+
+
+def _drain_custom_query_requests(
+    state: RuntimeState,
+    context: ConversationContext,
+    main_prompt: str,
+    llm_client: LlmClient,
+    logger: JsonlLogger | None,
+    emit: OutputEmitter,
+) -> None:
+    for query in state.consume_custom_query_requests():
+        _emit_custom_query_response(
+            query=query,
+            context=context,
+            main_prompt=main_prompt,
+            llm_client=llm_client,
+            logger=logger,
+            emit=emit,
+        )
+
+
+def _emit_custom_query_response(
+    query: str,
+    context: ConversationContext,
+    main_prompt: str,
+    llm_client: LlmClient,
+    logger: JsonlLogger | None,
+    emit: OutputEmitter,
+) -> None:
+    base_payload = context.render_for_prompt(main_prompt=main_prompt)
+    if not base_payload:
+        base_payload = (
+            f"Main prompt:\n{main_prompt}\n\n"
+            "Conversation context:\n(no transcript yet)"
+        )
+
+    prompt_payload = (
+        f"{base_payload}\n\n"
+        "User custom request:\n"
+        f"{query}\n\n"
+        "Answer this custom request directly and keep the answer practical."
+    )
+
+    answer = llm_client.generate_questions(prompt_payload)
+    _emit(emit, "\n[AI CUSTOM RESPONSE]\n" + answer + "\n")
+
+    if logger is not None:
+        logger.log(
+            "ai_custom_query",
+            {
+                "query": query,
+                "text": answer,
+            },
+        )
 
 
 def _save_snapshot(
     context: ConversationContext,
     output_dir: Path | None,
     logger: JsonlLogger | None,
+    emit: OutputEmitter,
 ) -> None:
     if output_dir is None:
-        print("Snapshot skipped: output directory not set.")
+        _emit(emit, "Snapshot skipped: output directory not set.")
         return
 
     snapshot_path = output_dir / f"snapshot-{int(time.time())}.txt"
     rendered = context.render_for_prompt(main_prompt="Snapshot")
     snapshot_path.write_text(rendered or "(no data)", encoding="utf-8")
-    print(f"Snapshot saved: {snapshot_path}")
+    _emit(emit, f"Snapshot saved: {snapshot_path}")
 
     if logger is not None:
         logger.log("snapshot", {"path": str(snapshot_path)})
 
 
-def _start_controls_thread(state: RuntimeState, question_interval_enabled: bool) -> threading.Thread:
+def _start_controls_thread(
+    state: RuntimeState,
+    question_interval_enabled: bool,
+    emit: OutputEmitter,
+) -> threading.Thread:
     def _loop() -> None:
         while not state.should_stop():
             try:
-                raw = input().strip()
+                raw = input()
             except EOFError:
                 break
 
-            if not raw:
+            cleaned = raw.strip()
+            if not cleaned:
                 continue
 
-            parts = raw.split()
-            cmd = parts[0].lower()
-
-            if cmd in {"h", "help", "?"}:
-                _print_controls_help(question_interval_enabled)
-            elif cmd == "p":
-                paused = state.toggle_pause()
-                print("Paused." if paused else "Resumed.")
-            elif cmd == "m":
-                mic_enabled = state.toggle_mic()
-                print("Mic listening ON." if mic_enabled else "Mic listening OFF.")
-            elif cmd == "i":
-                seconds = 30
-                if len(parts) > 1:
-                    try:
-                        seconds = int(parts[1])
-                    except ValueError:
-                        seconds = 30
-                until = state.set_ignore_remote_for(seconds)
-                print(f"Ignoring remote audio until {time.strftime('%H:%M:%S', time.localtime(until))}.")
-            elif cmd == "x":
-                if len(parts) < 2:
-                    print("Usage: x <speaker_id>")
-                    continue
-
-                speaker_id = parts[1].strip()
-                enabled = state.toggle_ignore_speaker(speaker_id)
-                if enabled:
-                    print(f"Speaker ignored: {speaker_id}")
-                else:
-                    print(f"Speaker unignored: {speaker_id}")
-            elif cmd == "k":
-                known = state.list_known_speakers()
-                ignored = state.list_ignored_speakers()
-                print("Known speakers: " + (", ".join(known) if known else "none"))
-                print("Ignored speakers: " + (", ".join(ignored) if ignored else "none"))
-            elif cmd == "g":
-                state.request_force_generation()
-                print("Manual AI generation requested.")
-            elif cmd == "s":
-                state.request_snapshot()
-                print("Snapshot requested.")
-            elif cmd == "q":
-                state.request_stop()
-                print("Stop requested.")
-            else:
-                print("Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, s, q")
+            _process_control_command(
+                raw=cleaned,
+                state=state,
+                question_interval_enabled=question_interval_enabled,
+                emit=emit,
+            )
 
     thread = threading.Thread(target=_loop, daemon=True)
     thread.start()
     return thread
 
 
-def _resolve_stt_backend_with_fallback(config: AppConfig) -> str:
+def _drain_command_queue(
+    command_queue: queue.Queue[str] | None,
+    state: RuntimeState,
+    question_interval_enabled: bool,
+    emit: OutputEmitter,
+) -> None:
+    if command_queue is None:
+        return
+
+    while True:
+        try:
+            raw = command_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        _process_control_command(
+            raw=raw,
+            state=state,
+            question_interval_enabled=question_interval_enabled,
+            emit=emit,
+        )
+
+
+def _process_control_command(
+    raw: str,
+    state: RuntimeState,
+    question_interval_enabled: bool,
+    emit: OutputEmitter,
+) -> None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return
+
+    parts = cleaned.split(maxsplit=1)
+    cmd = parts[0].lower()
+
+    if cmd in {"h", "help", "?"}:
+        _print_controls_help(question_interval_enabled, emit=emit)
+    elif cmd == "p":
+        paused = state.toggle_pause()
+        _emit(emit, "Paused." if paused else "Resumed.")
+    elif cmd == "m":
+        mic_enabled = state.toggle_mic()
+        _emit(emit, "Mic listening ON." if mic_enabled else "Mic listening OFF.")
+    elif cmd == "i":
+        seconds = 30
+        if len(parts) > 1:
+            try:
+                seconds = int(parts[1].split()[0])
+            except ValueError:
+                seconds = 30
+        until = state.set_ignore_remote_for(seconds)
+        _emit(emit, f"Ignoring remote audio until {time.strftime('%H:%M:%S', time.localtime(until))}.")
+    elif cmd == "x":
+        if len(parts) < 2:
+            _emit(emit, "Usage: x <speaker_id>")
+            return
+
+        speaker_id = parts[1].strip()
+        enabled = state.toggle_ignore_speaker(speaker_id)
+        if enabled:
+            _emit(emit, f"Speaker ignored: {speaker_id}")
+        else:
+            _emit(emit, f"Speaker unignored: {speaker_id}")
+    elif cmd == "k":
+        known = state.list_known_speakers()
+        ignored = state.list_ignored_speakers()
+        _emit(emit, "Known speakers: " + (", ".join(known) if known else "none"))
+        _emit(emit, "Ignored speakers: " + (", ".join(ignored) if ignored else "none"))
+    elif cmd == "g":
+        state.request_force_generation()
+        _emit(emit, "Manual AI generation requested.")
+    elif cmd in {"a", "ask"}:
+        query = parts[1].strip() if len(parts) > 1 else ""
+        if not state.request_custom_query(query):
+            _emit(emit, "Usage: a <your custom AI query>")
+            return
+        _emit(emit, "Custom AI query requested.")
+    elif cmd == "s":
+        state.request_snapshot()
+        _emit(emit, "Snapshot requested.")
+    elif cmd == "q":
+        state.request_stop()
+        _emit(emit, "Stop requested.")
+    else:
+        _emit(emit, "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, s, q")
+
+
+def _resolve_stt_backend_with_fallback(config: AppConfig, emit: OutputEmitter) -> str:
     backend = config.stt_backend.strip().lower()
     if backend != "vosk":
         return backend
@@ -661,7 +858,7 @@ def _resolve_stt_backend_with_fallback(config: AppConfig) -> str:
 
     whisper_model = config.whisper_cpp_model_path.strip()
     if whisper_model:
-        print("VOSK model path is empty. Falling back to whisper_cpp backend.")
+        _emit(emit, "VOSK model path is empty. Falling back to whisper_cpp backend.")
         return "whisper_cpp"
 
     raise RuntimeError(
@@ -670,7 +867,11 @@ def _resolve_stt_backend_with_fallback(config: AppConfig) -> str:
     )
 
 
-def _resolve_live_audio_sources(config: AppConfig, allow_prompt: bool) -> tuple[str, str]:
+def _resolve_live_audio_sources(
+    config: AppConfig,
+    allow_prompt: bool,
+    emit: OutputEmitter,
+) -> tuple[str, str]:
     monitors = list_monitor_sources()
     mics = list_mic_sources()
 
@@ -678,7 +879,7 @@ def _resolve_live_audio_sources(config: AppConfig, allow_prompt: bool) -> tuple[
     mic_source = config.mic_source.strip()
 
     if monitor_source and monitor_source not in monitors:
-        print(f"Configured monitor source not found: {monitor_source}")
+        _emit(emit, f"Configured monitor source not found: {monitor_source}")
         monitor_source = ""
 
     if not monitor_source:
@@ -689,7 +890,7 @@ def _resolve_live_audio_sources(config: AppConfig, allow_prompt: bool) -> tuple[
 
         if len(monitors) == 1:
             monitor_source = monitors[0]
-            print(f"Auto-selected monitor source: {monitor_source}")
+            _emit(emit, f"Auto-selected monitor source: {monitor_source}")
         else:
             default_monitor = choose_default_monitor_source(monitors)
             if allow_prompt:
@@ -698,26 +899,27 @@ def _resolve_live_audio_sources(config: AppConfig, allow_prompt: bool) -> tuple[
                     monitors,
                     default_source=default_monitor,
                     allow_skip=False,
+                    emit=emit,
                 )
             else:
                 monitor_source = default_monitor or monitors[0]
-                print(f"Auto-selected monitor source: {monitor_source}")
+                _emit(emit, f"Auto-selected monitor source: {monitor_source}")
 
     if not config.mic_listening_enabled:
         return monitor_source, ""
 
     if mic_source and mic_source not in mics:
-        print(f"Configured mic source not found: {mic_source}")
+        _emit(emit, f"Configured mic source not found: {mic_source}")
         mic_source = ""
 
     if not mic_source:
         if not mics:
-            print("No mic sources detected. Continuing with remote-only capture.")
+            _emit(emit, "No mic sources detected. Continuing with remote-only capture.")
             return monitor_source, ""
 
         if len(mics) == 1:
             mic_source = mics[0]
-            print(f"Auto-selected mic source: {mic_source}")
+            _emit(emit, f"Auto-selected mic source: {mic_source}")
         else:
             default_mic = choose_default_mic_source(mics)
             if allow_prompt:
@@ -726,10 +928,11 @@ def _resolve_live_audio_sources(config: AppConfig, allow_prompt: bool) -> tuple[
                     mics,
                     default_source=default_mic,
                     allow_skip=True,
+                    emit=emit,
                 )
             else:
                 mic_source = default_mic or mics[0]
-                print(f"Auto-selected mic source: {mic_source}")
+                _emit(emit, f"Auto-selected mic source: {mic_source}")
 
     return monitor_source, mic_source
 
@@ -739,14 +942,15 @@ def _prompt_select_source(
     sources: list[str],
     default_source: str | None,
     allow_skip: bool,
+    emit: OutputEmitter,
 ) -> str:
-    print(f"Detected multiple {kind} sources:")
+    _emit(emit, f"Detected multiple {kind} sources:")
     for index, source in enumerate(sources, start=1):
         marker = " (default)" if source == default_source else ""
-        print(f"  {index}. {source}{marker}")
+        _emit(emit, f"  {index}. {source}{marker}")
 
     if allow_skip:
-        print("  0. Disable this source")
+        _emit(emit, "  0. Disable this source")
 
     while True:
         prompt = f"Select {kind} source"
@@ -759,18 +963,18 @@ def _prompt_select_source(
             if default_source:
                 return default_source
             if not allow_skip:
-                print("Selection required.")
+                _emit(emit, "Selection required.")
                 continue
             return ""
 
         try:
             selected = int(raw)
         except ValueError:
-            print("Invalid selection. Enter a number.")
+            _emit(emit, "Invalid selection. Enter a number.")
             continue
 
         if allow_skip and selected == 0:
             return ""
         if 1 <= selected <= len(sources):
             return sources[selected - 1]
-        print("Selection out of range.")
+        _emit(emit, "Selection out of range.")

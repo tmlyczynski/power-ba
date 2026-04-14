@@ -30,17 +30,19 @@ class OpenAiClient(LlmClient):
         self._model = model
 
     def generate_questions(self, prompt_payload: str) -> str:
-        response = self._client.responses.create(
-            model=self._model,
-            temperature=0.2,
-            input=[
-                {
-                    "role": "system",
-                    "content": "Przygotuj konkretne pytania doprecyzowujace. Odpowiedz po polsku.",
-                },
-                {"role": "user", "content": prompt_payload},
-            ],
-        )
+        try:
+            response = self._client.responses.create(
+                model=self._model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": "Przygotuj konkretne pytania doprecyzowujace. Odpowiedz po polsku.",
+                    },
+                    {"role": "user", "content": prompt_payload},
+                ],
+            )
+        except Exception as exc:  # pragma: no cover
+            return f"[AI error] OpenAI request failed: {exc}"
 
         text = getattr(response, "output_text", "")
         if text and text.strip():
@@ -70,12 +72,15 @@ class AnthropicClient(LlmClient):
         self._model = model
 
     def generate_questions(self, prompt_payload: str) -> str:
-        response = self._client.messages.create(
-            model=self._model,
-            max_tokens=400,
-            system="Przygotuj konkretne pytania doprecyzowujace. Odpowiedz po polsku.",
-            messages=[{"role": "user", "content": prompt_payload}],
-        )
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=400,
+                system="Przygotuj konkretne pytania doprecyzowujace. Odpowiedz po polsku.",
+                messages=[{"role": "user", "content": prompt_payload}],
+            )
+        except Exception as exc:  # pragma: no cover
+            return f"[AI error] Anthropic request failed: {exc}"
 
         extracted: list[str] = []
         for item in response.content:

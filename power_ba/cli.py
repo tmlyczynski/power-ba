@@ -146,16 +146,7 @@ def _launch_tui_or_fallback(config_path: Path) -> bool:
         print("TUI unavailable, switching to legacy menu.")
         return False
 
-    action = launch_tui(config_path)
-    if action != "start":
-        return True
-
-    config = load_config(config_path)
-    try:
-        run_session(config=config, interactive_controls=True)
-    except Exception as exc:  # pragma: no cover
-        print(f"Session failed: {exc}")
-
+    launch_tui(config_path)
     return True
 
 
