@@ -33,6 +33,7 @@ Settings include:
 - mic listening on/off
 - auto interval on/off (can disable periodic generation completely)
 - question interval (default 30s, used when auto interval is on)
+- default AI context window (`20m`, `2h`, `1200`, or `all`)
 - main prompt (role prompt)
 - mic and monitor source
 - mic and monitor source picker from detected list (in TUI Settings)
@@ -53,6 +54,7 @@ Runtime controls during session:
 - `lang <pl|en>` change AI response language in current session
 - `style <text>` set persistent AI style for whole session
 - `style clear` clear persistent AI style
+- `ctx <20m|2h|1200|all>` change how much conversation context AI uses
 - `s` save context snapshot (when output directory is configured)
 - `q` stop session
 

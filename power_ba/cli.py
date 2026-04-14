@@ -230,23 +230,24 @@ def _settings_loop(config: AppConfig, config_path: Path) -> AppConfig:
         print(f"6. Mic listening         [{'on' if working.mic_listening_enabled else 'off'}]")
         print(f"7. Question interval     [{working.question_interval_seconds}s]")
         print(f"8. Auto interval         [{'on' if working.question_interval_enabled else 'off'}]")
-        print(f"9. Main role prompt      [{working.main_prompt[:45]}...]")
-        print(f"10. Mic source           [{working.mic_source or 'not set'}]")
-        print(f"11. Monitor source       [{working.monitor_source or 'not set'}]")
-        print(f"12. Output directory     [{working.default_output_dir or 'not set'}]")
-        print(f"13. Save audio files     [{'on' if working.save_audio_by_default else 'off'}]")
-        print(f"14. Save transcript logs [{'on' if working.save_transcript_by_default else 'off'}]")
-        print(f"15. STT backend          [{working.stt_backend}]")
-        print(f"16. VOSK model path      [{working.vosk_model_path or 'not set'}]")
-        print(f"17. whisper model path   [{working.whisper_cpp_model_path or 'not set'}]")
-        print(f"18. whisper binary       [{working.whisper_cpp_binary}]")
-        print(f"19. whisper chunk sec    [{working.whisper_cpp_chunk_seconds}s]")
-        print(f"20. Diarization          [{'on' if working.diarization_enabled else 'off'}]")
-        print(f"21. pyannote token       [{'set' if working.pyannote_hf_token else 'empty'}]")
-        print(f"22. pyannote model       [{working.pyannote_model_name}]")
-        print(f"23. diarization interval [{working.diarization_interval_seconds}s]")
-        print("24. Save and back")
-        print("25. Cancel and back")
+        print(f"9. AI context window     [{working.ai_context_window_default}]")
+        print(f"10. Main role prompt     [{working.main_prompt[:45]}...]")
+        print(f"11. Mic source           [{working.mic_source or 'not set'}]")
+        print(f"12. Monitor source       [{working.monitor_source or 'not set'}]")
+        print(f"13. Output directory     [{working.default_output_dir or 'not set'}]")
+        print(f"14. Save audio files     [{'on' if working.save_audio_by_default else 'off'}]")
+        print(f"15. Save transcript logs [{'on' if working.save_transcript_by_default else 'off'}]")
+        print(f"16. STT backend          [{working.stt_backend}]")
+        print(f"17. VOSK model path      [{working.vosk_model_path or 'not set'}]")
+        print(f"18. whisper model path   [{working.whisper_cpp_model_path or 'not set'}]")
+        print(f"19. whisper binary       [{working.whisper_cpp_binary}]")
+        print(f"20. whisper chunk sec    [{working.whisper_cpp_chunk_seconds}s]")
+        print(f"21. Diarization          [{'on' if working.diarization_enabled else 'off'}]")
+        print(f"22. pyannote token       [{'set' if working.pyannote_hf_token else 'empty'}]")
+        print(f"23. pyannote model       [{working.pyannote_model_name}]")
+        print(f"24. diarization interval [{working.diarization_interval_seconds}s]")
+        print("25. Save and back")
+        print("26. Cancel and back")
 
         choice = input("Select setting: ").strip()
 
@@ -281,62 +282,65 @@ def _settings_loop(config: AppConfig, config_path: Path) -> AppConfig:
         elif choice == "8":
             working.question_interval_enabled = not working.question_interval_enabled
         elif choice == "9":
+            ctx_window = input("Default AI context window [e.g. 20m / 2h / 1200 / all]: ").strip()
+            working.ai_context_window_default = ctx_window
+        elif choice == "10":
             prompt = input("Main role prompt: ").strip()
             if prompt:
                 working.main_prompt = prompt
-        elif choice == "10":
+        elif choice == "11":
             selected = _select_source("mic", working.mic_source)
             if selected is not None:
                 working.mic_source = selected
-        elif choice == "11":
+        elif choice == "12":
             selected = _select_source("monitor", working.monitor_source)
             if selected is not None:
                 working.monitor_source = selected
-        elif choice == "12":
+        elif choice == "13":
             output_dir = input("Default output directory (blank disables): ").strip()
             working.default_output_dir = output_dir
-        elif choice == "13":
-            working.save_audio_by_default = not working.save_audio_by_default
         elif choice == "14":
-            working.save_transcript_by_default = not working.save_transcript_by_default
+            working.save_audio_by_default = not working.save_audio_by_default
         elif choice == "15":
+            working.save_transcript_by_default = not working.save_transcript_by_default
+        elif choice == "16":
             backend = input("STT backend [vosk/whisper_cpp]: ").strip().lower()
             if backend in {"vosk", "whisper_cpp"}:
                 working.stt_backend = backend
             else:
                 print("Unsupported STT backend.")
-        elif choice == "16":
+        elif choice == "17":
             model_path = input("VOSK model path: ").strip()
             working.vosk_model_path = model_path
-        elif choice == "17":
+        elif choice == "18":
             model_path = input("whisper.cpp model path: ").strip()
             working.whisper_cpp_model_path = model_path
-        elif choice == "18":
+        elif choice == "19":
             binary = input("whisper.cpp binary (default whisper-cli): ").strip()
             if binary:
                 working.whisper_cpp_binary = binary
-        elif choice == "19":
+        elif choice == "20":
             val = _ask_optional_int("whisper.cpp chunk seconds: ")
             if val is not None:
                 working.whisper_cpp_chunk_seconds = val
-        elif choice == "20":
-            working.diarization_enabled = not working.diarization_enabled
         elif choice == "21":
+            working.diarization_enabled = not working.diarization_enabled
+        elif choice == "22":
             token = getpass.getpass("pyannote HF token (blank clears): ").strip()
             working.pyannote_hf_token = token
-        elif choice == "22":
+        elif choice == "23":
             name = input("pyannote model name: ").strip()
             if name:
                 working.pyannote_model_name = name
-        elif choice == "23":
+        elif choice == "24":
             val = _ask_optional_int("Diarization interval in seconds: ")
             if val is not None:
                 working.diarization_interval_seconds = val
-        elif choice == "24":
+        elif choice == "25":
             saved_path = save_config(working, config_path)
             print(f"Config saved: {saved_path}")
             return working
-        elif choice == "25":
+        elif choice == "26":
             print("Canceled settings changes.")
             return config
         else:

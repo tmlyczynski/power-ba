@@ -28,7 +28,7 @@ class DisabledLlmClient(LlmClient):
 
 def _normalize_ai_language(value: str) -> str:
     normalized = value.strip().lower()
-    if normalized in {"en", "english"}:
+    if normalized in {"en", "english", "angielski"}:
         return "en"
     return "pl"
 

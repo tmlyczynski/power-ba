@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,51 @@ DEFAULT_MAIN_PROMPT = (
 )
 
 
+def _normalize_context_window_default(value: Any, fallback_seconds: int) -> str:
+    fallback = f"{max(5, int(fallback_seconds))}s"
+    if value is None:
+        return fallback
+
+    normalized = str(value).strip().lower().replace(" ", "")
+    if not normalized:
+        return fallback
+
+    if normalized in {"all", "full", "whole", "max", "unlimited", "nolimit", "no-limit"}:
+        return "all"
+
+    match = re.fullmatch(r"(\d+)([a-z]*)", normalized)
+    if not match:
+        return fallback
+
+    amount = int(match.group(1))
+    if amount <= 0:
+        return fallback
+
+    unit = match.group(2)
+    multipliers = {
+        "": 1,
+        "s": 1,
+        "sec": 1,
+        "secs": 1,
+        "second": 1,
+        "seconds": 1,
+        "m": 60,
+        "min": 60,
+        "mins": 60,
+        "minute": 60,
+        "minutes": 60,
+        "h": 3600,
+        "hr": 3600,
+        "hrs": 3600,
+        "hour": 3600,
+        "hours": 3600,
+    }
+    if unit not in multipliers:
+        return fallback
+
+    return f"{amount * multipliers[unit]}s"
+
+
 @dataclass
 class AppConfig:
     provider: str = "openai"
@@ -24,6 +70,7 @@ class AppConfig:
     question_interval_enabled: bool = True
     question_interval_seconds: int = 30
     context_window_seconds: int = 120
+    ai_context_window_default: str = ""
     ai_language: str = "pl"
     main_prompt: str = DEFAULT_MAIN_PROMPT
     stt_backend: str = "vosk"
@@ -60,13 +107,19 @@ class AppConfig:
         if self.question_interval_seconds < 5:
             self.question_interval_seconds = 5
         normalized_language = self.ai_language.strip().lower()
-        if normalized_language in {"en", "english"}:
+        if normalized_language in {"en", "english", "angielski"}:
             self.ai_language = "en"
+        elif normalized_language in {"pl", "polski", "polish"}:
+            self.ai_language = "pl"
         else:
             self.ai_language = "pl"
         required_window = self.question_interval_seconds if self.question_interval_enabled else 60
         if self.context_window_seconds < required_window:
             self.context_window_seconds = max(required_window, 60)
+        self.ai_context_window_default = _normalize_context_window_default(
+            self.ai_context_window_default,
+            fallback_seconds=self.context_window_seconds,
+        )
         if self.stt_backend not in {"vosk", "whisper_cpp"}:
             self.stt_backend = "vosk"
         if self.whisper_cpp_chunk_seconds < 2:

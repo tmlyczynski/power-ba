@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static, Switch
 
@@ -19,20 +19,24 @@ def _copy_config(config: AppConfig) -> AppConfig:
     return AppConfig.from_dict(asdict(config))
 
 
-SESSION_COMMANDS_TEXT = (
-    "Komendy sesji (wpisz w dolnym polu i Enter):\n"
+SESSION_COMMANDS_LEFT_TEXT = (
     "h        pomoc\n"
     "p        pauza/wznowienie\n"
     "m        mikrofon on/off\n"
-    "i 30     ignoruj zdalny glos przez 30s\n"
-    "x ID     ignoruj/odblokuj mowce (np. x SPEAKER_00)\n"
-    "k        pokaz znanych i ignorowanych mowcow\n"
-    "g        wygeneruj pytania AI teraz\n"
-    "a tekst  doprecyzuj/wyslij nowe zapytanie do AI\n"
-    "lang en  zmien jezyk AI (pl/en)\n"
-    "style t  ustaw styl odpowiedzi AI na cala sesje\n"
-    "s        zapisz snapshot (gdy ustawiono output)\n"
-    "q        zatrzymaj sesje"
+    "i 30     ignoruj zdalny glos\n"
+    "x ID     ignoruj/odblokuj mowce\n"
+    "k        lista znanych/ignorowanych"
+)
+
+SESSION_COMMANDS_RIGHT_TEXT = (
+    "g        pytania AI teraz\n"
+    "a ...    nowe zapytanie do AI\n"
+    "lang en  jezyk AI\n"
+    "style .. styl odpowiedzi AI\n"
+    "ctx 20m  kontekst ostatnich 20 min\n"
+    "ctx all  kontekst bez limitu\n"
+    "s        zapisz snapshot\n"
+    "q        stop sesji"
 )
 
 
@@ -48,7 +52,7 @@ class MainMenuScreen(Screen[None]):
             Button("2. Settings", id="settings", variant="primary"),
             Button("3. Exit", id="exit", variant="error"),
             Static(
-                "During session controls: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, s, q",
+                "During session controls: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, ctx <20m|all>, s, q",
                 id="hints",
             ),
             id="menu",
@@ -85,10 +89,15 @@ class SessionScreen(Screen[None]):
         yield Header(show_clock=True)
         yield Vertical(
             Label("Session Running", id="session_title"),
-            Static(SESSION_COMMANDS_TEXT, id="session_commands"),
+            Label("Komendy sesji (Enter):", id="session_commands_title"),
+            Horizontal(
+                Static(SESSION_COMMANDS_LEFT_TEXT, classes="session_commands_col"),
+                Static(SESSION_COMMANDS_RIGHT_TEXT, classes="session_commands_col"),
+                id="session_commands_grid",
+            ),
             RichLog(id="session_log", wrap=True, markup=False, highlight=False),
             Input(
-                placeholder="Wpisz komende (g, a doprecyzuj..., lang en, style tylko ryzyka, q)",
+                placeholder="Wpisz komende (g, a doprecyzuj..., lang en, style tylko ryzyka, ctx 20m, q)",
                 id="session_input",
             ),
             id="session_view",
@@ -239,6 +248,11 @@ class SettingsScreen(Screen[None]):
                 id="question_interval_seconds",
                 placeholder="question interval seconds",
             ),
+            Input(
+                value=self._working.ai_context_window_default,
+                id="ai_context_window_default",
+                placeholder="AI context window default (e.g. 20m or all)",
+            ),
             Static("Auto interval"),
             Switch(value=self._working.question_interval_enabled, id="question_interval_enabled"),
             Input(value=self._working.main_prompt, id="main_prompt", placeholder="main role prompt"),
@@ -357,6 +371,7 @@ class SettingsScreen(Screen[None]):
         self._working.anthropic_api_key = self.query_one("#anthropic_api_key", Input).value.strip()
         self._working.main_prompt = self.query_one("#main_prompt", Input).value.strip()
         self._working.default_output_dir = self.query_one("#default_output_dir", Input).value.strip()
+        self._working.ai_context_window_default = self.query_one("#ai_context_window_default", Input).value.strip()
         self._working.stt_backend = self.query_one("#stt_backend", Input).value.strip()
         self._working.vosk_model_path = self.query_one("#vosk_model_path", Input).value.strip()
         self._working.whisper_cpp_model_path = self.query_one("#whisper_cpp_model_path", Input).value.strip()
@@ -444,9 +459,21 @@ class PowerBATui(App[None]):
         margin-bottom: 1;
     }
 
-    #session_commands {
-        color: #d6e2dd;
+    #session_commands_title {
+        color: #c9d6d1;
+        margin-bottom: 0;
+    }
+
+    #session_commands_grid {
+        height: auto;
         margin-bottom: 1;
+    }
+
+    .session_commands_col {
+        width: 1fr;
+        color: #b9c6c1;
+        text-style: dim;
+        padding: 0 1 0 0;
     }
 
     #session_log {

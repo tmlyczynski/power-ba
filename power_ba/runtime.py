@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -41,6 +42,82 @@ def _parse_ai_language(value: str) -> str | None:
     if normalized in {"pl", "polski", "polish"}:
         return "pl"
     return None
+
+
+def _parse_context_window_spec(value: str) -> int | None:
+    cleaned = value.strip().lower().replace(" ", "")
+    if not cleaned:
+        raise ValueError("empty value")
+
+    if cleaned in {"all", "full", "whole", "max", "unlimited", "nolimit", "no-limit"}:
+        return None
+
+    match = re.fullmatch(r"(\d+)([a-z]*)", cleaned)
+    if not match:
+        raise ValueError("invalid format")
+
+    amount = int(match.group(1))
+    if amount <= 0:
+        raise ValueError("value must be > 0")
+
+    unit = match.group(2)
+    multipliers = {
+        "": 1,
+        "s": 1,
+        "sec": 1,
+        "secs": 1,
+        "second": 1,
+        "seconds": 1,
+        "m": 60,
+        "min": 60,
+        "mins": 60,
+        "minute": 60,
+        "minutes": 60,
+        "h": 3600,
+        "hr": 3600,
+        "hrs": 3600,
+        "hour": 3600,
+        "hours": 3600,
+    }
+    if unit not in multipliers:
+        raise ValueError("unsupported unit")
+
+    return amount * multipliers[unit]
+
+
+def _format_context_window_spec(seconds: int | None) -> str:
+    if seconds is None:
+        return "full session context (no time limit)"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h ({seconds}s)"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m ({seconds}s)"
+    return f"{seconds}s"
+
+
+def _resolve_initial_context_window(
+    config: AppConfig,
+    required_window: int,
+    emit: OutputEmitter,
+) -> int | None:
+    fallback_seconds = max(config.context_window_seconds, required_window)
+    raw_default = config.ai_context_window_default.strip()
+    if not raw_default:
+        return fallback_seconds
+
+    try:
+        parsed = _parse_context_window_spec(raw_default)
+    except ValueError:
+        _emit(
+            emit,
+            f"Invalid default AI context window '{raw_default}'. Falling back to {fallback_seconds}s.",
+        )
+        return fallback_seconds
+
+    if parsed is not None and parsed < 5:
+        return 5
+
+    return parsed
 
 
 @dataclass
@@ -238,6 +315,7 @@ def _print_controls_help(
     _emit(emit, "  a <text>   send custom AI query / refine follow-up")
     _emit(emit, "  lang <pl|en> set AI response language")
     _emit(emit, "  style <text> set persistent AI style for this session")
+    _emit(emit, "  ctx <20m|2h|1200|all> set AI context time window")
     _emit(emit, "  s          save text snapshot (requires output directory)")
     _emit(emit, "  h          show this help again")
     _emit(emit, "  q          stop current session")
@@ -284,7 +362,12 @@ def run_session(
         ai_language=config.ai_language,
     )
     required_window = question_interval if question_interval_enabled else 60
-    context = ConversationContext(window_seconds=max(config.context_window_seconds, required_window))
+    initial_context_window = _resolve_initial_context_window(
+        config=config,
+        required_window=required_window,
+        emit=emit,
+    )
+    context = ConversationContext(window_seconds=initial_context_window)
     llm_client = build_llm_client(
         provider=config.provider,
         model=config.model,
@@ -332,6 +415,7 @@ def run_session(
             controls_enabled = True
             _start_controls_thread(
                 state,
+                context=context,
                 question_interval_enabled=question_interval_enabled,
                 emit=emit,
             )
@@ -463,6 +547,7 @@ def _run_live_session(
             _drain_command_queue(
                 command_queue=command_queue,
                 state=state,
+                context=context,
                 question_interval_enabled=question_interval_enabled,
                 emit=emit,
             )
@@ -640,6 +725,7 @@ def _run_dry_session(
         _drain_command_queue(
             command_queue=command_queue,
             state=state,
+            context=context,
             question_interval_enabled=question_interval_enabled,
             emit=emit,
         )
@@ -776,7 +862,7 @@ def _emit_questions(
     style_instruction: str,
     emit: OutputEmitter,
 ) -> None:
-    payload = context.render_for_prompt(main_prompt=main_prompt)
+    payload = context.render_for_prompt(main_prompt=main_prompt, ai_language=ai_language)
     if not payload:
         _emit(emit, "[AI] Waiting for more conversation context.")
         return
@@ -825,19 +911,35 @@ def _emit_custom_query_response(
     style_instruction: str,
     emit: OutputEmitter,
 ) -> None:
-    base_payload = context.render_for_prompt(main_prompt=main_prompt)
-    if not base_payload:
-        base_payload = (
-            f"Main prompt:\n{main_prompt}\n\n"
-            "Conversation context:\n(no transcript yet)"
-        )
+    is_english = ai_language == "en"
 
-    prompt_payload = (
-        f"{base_payload}\n\n"
-        "User custom request:\n"
-        f"{query}\n\n"
-        "Answer this custom request directly and keep the answer practical."
-    )
+    base_payload = context.render_for_prompt(main_prompt=main_prompt, ai_language=ai_language)
+    if not base_payload:
+        if is_english:
+            base_payload = (
+                f"Main prompt:\n{main_prompt}\n\n"
+                "Conversation context:\n(no transcript yet)"
+            )
+        else:
+            base_payload = (
+                f"Glowny prompt:\n{main_prompt}\n\n"
+                "Kontekst rozmowy:\n(brak transkrypcji)"
+            )
+
+    if is_english:
+        prompt_payload = (
+            f"{base_payload}\n\n"
+            "User custom request:\n"
+            f"{query}\n\n"
+            "Answer this custom request directly and keep the answer practical."
+        )
+    else:
+        prompt_payload = (
+            f"{base_payload}\n\n"
+            "Dodatkowe zapytanie uzytkownika:\n"
+            f"{query}\n\n"
+            "Odpowiedz bezposrednio na to zapytanie i trzymaj odpowiedz praktyczna."
+        )
 
     answer = llm_client.generate_questions(
         prompt_payload,
@@ -877,6 +979,7 @@ def _save_snapshot(
 
 def _start_controls_thread(
     state: RuntimeState,
+    context: ConversationContext,
     question_interval_enabled: bool,
     emit: OutputEmitter,
 ) -> threading.Thread:
@@ -894,6 +997,7 @@ def _start_controls_thread(
             _process_control_command(
                 raw=cleaned,
                 state=state,
+                context=context,
                 question_interval_enabled=question_interval_enabled,
                 emit=emit,
             )
@@ -906,6 +1010,7 @@ def _start_controls_thread(
 def _drain_command_queue(
     command_queue: queue.Queue[str] | None,
     state: RuntimeState,
+    context: ConversationContext,
     question_interval_enabled: bool,
     emit: OutputEmitter,
 ) -> None:
@@ -921,6 +1026,7 @@ def _drain_command_queue(
         _process_control_command(
             raw=raw,
             state=state,
+            context=context,
             question_interval_enabled=question_interval_enabled,
             emit=emit,
         )
@@ -929,6 +1035,7 @@ def _drain_command_queue(
 def _process_control_command(
     raw: str,
     state: RuntimeState,
+    context: ConversationContext,
     question_interval_enabled: bool,
     emit: OutputEmitter,
 ) -> None:
@@ -1015,6 +1122,22 @@ def _process_control_command(
 
         state.set_ai_style_instruction(style_value)
         _emit(emit, "AI style instruction updated.")
+    elif cmd in {"ctx", "context", "window"}:
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if not value:
+            current_window = context.get_window_seconds()
+            _emit(emit, f"Current AI context window: {_format_context_window_spec(current_window)}")
+            _emit(emit, "Usage: ctx <seconds|Xm|Xh|all> (examples: ctx 1200, ctx 20m, ctx all)")
+            return
+
+        try:
+            parsed_window = _parse_context_window_spec(value)
+        except ValueError:
+            _emit(emit, "Invalid context window. Use e.g. ctx 1200, ctx 20m, ctx 2h, ctx all")
+            return
+
+        context.set_window_seconds(parsed_window)
+        _emit(emit, f"AI context window set to: {_format_context_window_spec(parsed_window)}")
     elif cmd == "s":
         state.request_snapshot()
         _emit(emit, "Snapshot requested.")
@@ -1024,7 +1147,7 @@ def _process_control_command(
     else:
         _emit(
             emit,
-            "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, s, q",
+            "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, ctx <20m|all>, s, q",
         )
 
 
