@@ -133,6 +133,7 @@ class RuntimeState:
     ai_style_instruction: str = ""
     ignored_speakers: set[str] = field(default_factory=set)
     known_speakers: set[str] = field(default_factory=set)
+    recent_answer_requests: list[int | None] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def toggle_pause(self) -> bool:
@@ -238,6 +239,20 @@ class RuntimeState:
         with self._lock:
             return self.ai_style_instruction
 
+    def request_recent_answers(self, window_seconds: int | None) -> bool:
+        with self._lock:
+            self.recent_answer_requests.append(window_seconds)
+        return True
+
+    def consume_recent_answer_requests(self) -> list[int | None]:
+        with self._lock:
+            if not self.recent_answer_requests:
+                return []
+
+            pending = list(self.recent_answer_requests)
+            self.recent_answer_requests.clear()
+            return pending
+
     def register_speaker(self, speaker: str) -> None:
         cleaned = speaker.strip()
         if not cleaned:
@@ -313,6 +328,7 @@ def _print_controls_help(
     _emit(emit, "  k          show known speakers and ignored speakers")
     _emit(emit, "  g          generate AI questions now (manual trigger)")
     _emit(emit, "  a <text>   send custom AI query / refine follow-up")
+    _emit(emit, "  ra [<20s|2m|Xh|all>]  answer direct questions from recent context (default 2m)")
     _emit(emit, "  lang <pl|en> set AI response language")
     _emit(emit, "  style <text> set persistent AI style for this session")
     _emit(emit, "  ctx <20m|2h|1200|all> set AI context time window")
@@ -559,6 +575,14 @@ def _run_live_session(
                 logger=logger,
                 emit=emit,
             )
+            _drain_recent_answer_requests(
+                state=state,
+                context=context,
+                main_prompt=main_prompt,
+                llm_client=llm_client,
+                logger=logger,
+                emit=emit,
+            )
 
             if max_runtime is not None and now - start_time >= max_runtime:
                 state.request_stop()
@@ -737,6 +761,14 @@ def _run_dry_session(
             logger=logger,
             emit=emit,
         )
+        _drain_recent_answer_requests(
+            state=state,
+            context=context,
+            main_prompt=main_prompt,
+            llm_client=llm_client,
+            logger=logger,
+            emit=emit,
+        )
 
         if max_runtime is not None and now - start_time >= max_runtime:
             state.request_stop()
@@ -901,6 +933,83 @@ def _drain_custom_query_requests(
         )
 
 
+def _drain_recent_answer_requests(
+    state: RuntimeState,
+    context: ConversationContext,
+    main_prompt: str,
+    llm_client: LlmClient,
+    logger: JsonlLogger | None,
+    emit: OutputEmitter,
+) -> None:
+    for window in state.consume_recent_answer_requests():
+        ai_language = state.get_ai_language()
+        style_instruction = state.get_ai_style_instruction()
+        _emit_recent_answers(
+            context=context,
+            main_prompt=main_prompt,
+            llm_client=llm_client,
+            logger=logger,
+            ai_language=ai_language,
+            style_instruction=style_instruction,
+            window_seconds=window,
+            emit=emit,
+        )
+
+
+def _emit_recent_answers(
+    context: ConversationContext,
+    main_prompt: str,
+    llm_client: LlmClient,
+    logger: JsonlLogger | None,
+    ai_language: str,
+    style_instruction: str,
+    window_seconds: int | None,
+    emit: OutputEmitter,
+) -> None:
+    now = time.time()
+
+    if window_seconds is None:
+        lines = context.all_lines()
+    else:
+        cutoff = now - max(0, int(window_seconds))
+        lines = [line for line in context.all_lines() if line.timestamp >= cutoff]
+
+    if not lines:
+        _emit(emit, f"[AI] No recent transcript in the selected window ({_format_context_window_spec(window_seconds)}).")
+        return
+
+    language = ai_language if ai_language in {"en", "pl"} else ("pl" if not _parse_ai_language(ai_language) else _parse_ai_language(ai_language))
+    transcript_lines: list[str] = []
+    for line in lines:
+        label = context._label_for_line(line, ai_language=language)
+        transcript_lines.append(f"[{label}] {line.text}")
+
+    transcript = "\n".join(transcript_lines)
+
+    if language == "en":
+        prompt_payload = (
+            f"MAIN ROLE PROMPT:\n{main_prompt.strip()}\n\n"
+            f"RECENT CONVERSATION CONTEXT (last {_format_context_window_spec(window_seconds)}):\n{transcript}\n\n"
+            "Identify any direct questions present in the conversation above and answer them directly and concisely. If there are no direct questions, reply with a short message stating that."
+        )
+    else:
+        prompt_payload = (
+            f"GLOWNY PROMPT ROLI:\n{main_prompt.strip()}\n\n"
+            f"KONTEKST OSTATNIEJ ROZMOWY (ostatnie {_format_context_window_spec(window_seconds)}):\n{transcript}\n\n"
+            "Znajdz bezposrednie pytania w powyzszym kontekscie i odpowiedz na nie krotko i rzeczowo. Jesli nie ma pytan, odpowiedz kroto, ze brak bezposrednich pytan."
+        )
+
+    answer = llm_client.generate_questions(
+        prompt_payload,
+        ai_language=ai_language,
+        style_instruction=style_instruction,
+    )
+    _emit(emit, "\n[AI RECENT ANSWERS]\n" + answer + "\n")
+
+    if logger is not None:
+        logger.log("ai_recent_answers", {"window_seconds": window_seconds, "text": answer})
+
+
 def _emit_custom_query_response(
     query: str,
     context: ConversationContext,
@@ -912,19 +1021,20 @@ def _emit_custom_query_response(
     emit: OutputEmitter,
 ) -> None:
     is_english = ai_language == "en"
-
-    base_payload = context.render_for_prompt(main_prompt=main_prompt, ai_language=ai_language)
-    if not base_payload:
+    # Build a payload for custom user queries that does NOT ask the model
+    # to propose follow-up questions (avoid mixing custom answers with
+    # the periodic "g" question-generation behaviour).
+    transcript = context.render_full_transcript()
+    if transcript:
         if is_english:
-            base_payload = (
-                f"Main prompt:\n{main_prompt}\n\n"
-                "Conversation context:\n(no transcript yet)"
-            )
+            base_payload = f"Main prompt:\n{main_prompt}\n\nConversation context:\n{transcript}"
         else:
-            base_payload = (
-                f"Glowny prompt:\n{main_prompt}\n\n"
-                "Kontekst rozmowy:\n(brak transkrypcji)"
-            )
+            base_payload = f"Glowny prompt:\n{main_prompt}\n\nKontekst rozmowy:\n{transcript}"
+    else:
+        if is_english:
+            base_payload = f"Main prompt:\n{main_prompt}\n\nConversation context:\n(no transcript yet)"
+        else:
+            base_payload = f"Glowny prompt:\n{main_prompt}\n\nKontekst rozmowy:\n(brak transkrypcji)"
 
     if is_english:
         prompt_payload = (
@@ -1088,6 +1198,22 @@ def _process_control_command(
             _emit(emit, "Usage: a <your custom AI query>")
             return
         _emit(emit, "Custom AI query requested.")
+    elif cmd in {"ra", "ans"}:
+        # Recent-answers: answer direct questions found in recent context window.
+        value = parts[1].strip() if len(parts) > 1 else ""
+        # default to 2 minutes
+        window: int | None = 120
+        if value:
+            token = value.split(maxsplit=1)[0]
+            try:
+                parsed = _parse_context_window_spec(token)
+            except ValueError:
+                _emit(emit, "Usage: ra <seconds|Xm|Xh|all> (examples: ra 120, ra 2m, ra all)")
+                return
+            window = parsed
+
+        state.request_recent_answers(window)
+        _emit(emit, f"Recent-answers requested for: {_format_context_window_spec(window)}")
     elif cmd in {"lang", "language", "l"}:
         language_value = ""
         if len(parts) > 1:

@@ -31,6 +31,7 @@ SESSION_COMMANDS_LEFT_TEXT = (
 SESSION_COMMANDS_RIGHT_TEXT = (
     "g        pytania AI teraz\n"
     "a ...    nowe zapytanie do AI\n"
+    "ra 2m    odpowiedz na pytania z ostatnich 2 min (uzyj ra 5m)\n"
     "lang en  jezyk AI\n"
     "style .. styl odpowiedzi AI\n"
     "ctx 20m  kontekst ostatnich 20 min\n"
