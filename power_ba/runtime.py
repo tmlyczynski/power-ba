@@ -894,20 +894,29 @@ def _emit_questions(
     style_instruction: str,
     emit: OutputEmitter,
 ) -> None:
+    # Render prompt synchronously (safe snapshot of context) then run LLM in background
     payload = context.render_for_prompt(main_prompt=main_prompt, ai_language=ai_language)
     if not payload:
         _emit(emit, "[AI] Waiting for more conversation context.")
         return
 
-    answer = llm_client.generate_questions(
-        payload,
-        ai_language=ai_language,
-        style_instruction=style_instruction,
-    )
-    _emit(emit, "\n[AI QUESTIONS]\n" + answer + "\n")
+    def _worker(prompt_payload: str) -> None:
+        try:
+            answer = llm_client.generate_questions(
+                prompt_payload,
+                ai_language=ai_language,
+                style_instruction=style_instruction,
+            )
+        except Exception as exc:  # pragma: no cover - network/LLM errors
+            _emit(emit, f"[AI error] Generation failed: {exc}")
+            return
 
-    if logger is not None:
-        logger.log("ai_questions", {"text": answer})
+        _emit(emit, "\n[AI QUESTIONS]\n" + answer + "\n")
+        if logger is not None:
+            logger.log("ai_questions", {"text": answer})
+
+    thread = threading.Thread(target=_worker, args=(payload,), daemon=True)
+    thread.start()
 
 
 def _drain_custom_query_requests(
@@ -966,6 +975,7 @@ def _emit_recent_answers(
     window_seconds: int | None,
     emit: OutputEmitter,
 ) -> None:
+    # Snapshot recent lines synchronously to avoid concurrent access races
     now = time.time()
 
     if window_seconds is None:
@@ -999,15 +1009,23 @@ def _emit_recent_answers(
             "Znajdz bezposrednie pytania w powyzszym kontekscie i odpowiedz na nie krotko i rzeczowo. Jesli nie ma pytan, odpowiedz kroto, ze brak bezposrednich pytan."
         )
 
-    answer = llm_client.generate_questions(
-        prompt_payload,
-        ai_language=ai_language,
-        style_instruction=style_instruction,
-    )
-    _emit(emit, "\n[AI RECENT ANSWERS]\n" + answer + "\n")
+    def _worker(prompt_payload: str, win: int | None) -> None:
+        try:
+            answer = llm_client.generate_questions(
+                prompt_payload,
+                ai_language=ai_language,
+                style_instruction=style_instruction,
+            )
+        except Exception as exc:  # pragma: no cover - network/LLM errors
+            _emit(emit, f"[AI error] Recent-answers generation failed: {exc}")
+            return
 
-    if logger is not None:
-        logger.log("ai_recent_answers", {"window_seconds": window_seconds, "text": answer})
+        _emit(emit, "\n[AI RECENT ANSWERS]\n" + answer + "\n")
+        if logger is not None:
+            logger.log("ai_recent_answers", {"window_seconds": win, "text": answer})
+
+    thread = threading.Thread(target=_worker, args=(prompt_payload, window_seconds), daemon=True)
+    thread.start()
 
 
 def _emit_custom_query_response(
@@ -1024,6 +1042,7 @@ def _emit_custom_query_response(
     # Build a payload for custom user queries that does NOT ask the model
     # to propose follow-up questions (avoid mixing custom answers with
     # the periodic "g" question-generation behaviour).
+    # Build prompt payload synchronously (snapshot) then call LLM in background
     transcript = context.render_full_transcript()
     if transcript:
         if is_english:
@@ -1051,21 +1070,29 @@ def _emit_custom_query_response(
             "Odpowiedz bezposrednio na to zapytanie i trzymaj odpowiedz praktyczna."
         )
 
-    answer = llm_client.generate_questions(
-        prompt_payload,
-        ai_language=ai_language,
-        style_instruction=style_instruction,
-    )
-    _emit(emit, "\n[AI CUSTOM RESPONSE]\n" + answer + "\n")
+    def _worker(prompt_payload: str, user_query: str) -> None:
+        try:
+            answer = llm_client.generate_questions(
+                prompt_payload,
+                ai_language=ai_language,
+                style_instruction=style_instruction,
+            )
+        except Exception as exc:  # pragma: no cover - network/LLM errors
+            _emit(emit, f"[AI error] Custom request failed: {exc}")
+            return
 
-    if logger is not None:
-        logger.log(
-            "ai_custom_query",
-            {
-                "query": query,
-                "text": answer,
-            },
-        )
+        _emit(emit, "\n[AI CUSTOM RESPONSE]\n" + answer + "\n")
+        if logger is not None:
+            logger.log(
+                "ai_custom_query",
+                {
+                    "query": user_query,
+                    "text": answer,
+                },
+            )
+
+    thread = threading.Thread(target=_worker, args=(prompt_payload, query), daemon=True)
+    thread.start()
 
 
 def _save_snapshot(
@@ -1273,7 +1300,8 @@ def _process_control_command(
     else:
         _emit(
             emit,
-            "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, lang <pl|en>, style <text>, ctx <20m|all>, s, q",
+            "Unknown command. Use: h, p, m, i [sec], x <speaker>, k, g, a <text>, ra [window], "
+            "lang <pl|en>, style <text>, ctx <20m|all>, s, q",
         )
 
 

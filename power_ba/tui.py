@@ -5,6 +5,7 @@ import threading
 from dataclasses import asdict
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
@@ -37,7 +38,7 @@ SESSION_COMMANDS_RIGHT_TEXT = (
     "lang en  jezyk AI\n"
     "style .. styl odpowiedzi AI\n"
     "s        zapisz snapshot\n"
-    "q        stop sesji\n"
+    "q        stop sesji\n "
 )
 
 
@@ -85,6 +86,7 @@ class SessionScreen(Screen[None]):
         self._commands: queue.Queue[str] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
+        self._log_block_kind: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -149,7 +151,51 @@ class SessionScreen(Screen[None]):
     def _write_log(self, message: str) -> None:
         log_widget = self.query_one("#session_log", RichLog)
         for line in message.splitlines() or [""]:
-            log_widget.write(line)
+            log_widget.write(self._style_log_line(line))
+
+    def _style_log_line(self, line: str) -> Text:
+        stripped = line.strip()
+
+        if not stripped:
+            self._log_block_kind = None
+            return Text("")
+
+        if stripped.startswith(">"):
+            self._log_block_kind = None
+            return Text(line, style="bold yellow")
+
+        if stripped in {"[AI QUESTIONS]", "[AI CUSTOM RESPONSE]", "[AI RECENT ANSWERS]"}:
+            self._log_block_kind = "ai"
+            return Text(line, style="bold bright_cyan")
+
+        if stripped.startswith("[AI error]"):
+            self._log_block_kind = None
+            return Text(line, style="bold red")
+
+        if stripped.startswith("[AI]"):
+            self._log_block_kind = None
+            return Text(line, style="bright_cyan")
+
+        if stripped.startswith("Session failed:"):
+            self._log_block_kind = None
+            return Text(line, style="bold red")
+
+        if stripped.startswith("Snapshot saved:"):
+            self._log_block_kind = None
+            return Text(line, style="green")
+
+        if stripped.startswith("[") and "] [" in stripped:
+            self._log_block_kind = None
+            if "[JA]" in line or "[ME]" in line:
+                return Text(line, style="green")
+            if "[MEET" in line:
+                return Text(line, style="bright_blue")
+            return Text(line, style="white")
+
+        if self._log_block_kind == "ai":
+            return Text(line, style="cyan")
+
+        return Text(line, style="white")
 
 
 class SourcePickerScreen(Screen[str | None]):
