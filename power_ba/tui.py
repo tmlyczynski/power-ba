@@ -25,7 +25,9 @@ SESSION_COMMANDS_LEFT_TEXT = (
     "m        mikrofon on/off\n"
     "i 30     ignoruj zdalny glos\n"
     "x ID     ignoruj/odblokuj mowce\n"
-    "k        lista znanych/ignorowanych"
+    "k        lista znanych/ignorowanych\n"
+    "ctx 20m  kontekst ostatnich 20 min\n"
+    "ctx all  kontekst bez limitu\n"
 )
 
 SESSION_COMMANDS_RIGHT_TEXT = (
@@ -34,10 +36,8 @@ SESSION_COMMANDS_RIGHT_TEXT = (
     "ra 2m    odpowiedz na pytania z ostatnich 2 min (uzyj ra 5m)\n"
     "lang en  jezyk AI\n"
     "style .. styl odpowiedzi AI\n"
-    "ctx 20m  kontekst ostatnich 20 min\n"
-    "ctx all  kontekst bez limitu\n"
     "s        zapisz snapshot\n"
-    "q        stop sesji"
+    "q        stop sesji\n"
 )
 
 
