@@ -86,7 +86,7 @@ class SessionScreen(Screen[None]):
         self._commands: queue.Queue[str] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._running = False
-        self._log_block_kind: str | None = None
+        self._ai_log_block_kind: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -97,8 +97,21 @@ class SessionScreen(Screen[None]):
                 Static(SESSION_COMMANDS_LEFT_TEXT, classes="session_commands_col"),
                 Static(SESSION_COMMANDS_RIGHT_TEXT, classes="session_commands_col"),
                 id="session_commands_grid",
+                classes="hidden",
             ),
-            RichLog(id="session_log", wrap=True, markup=False, highlight=False),
+            Vertical(
+                Vertical(
+                    Label("Transkrypcja", id="transcript_title"),
+                    RichLog(id="transcript_log", wrap=True, markup=False, highlight=False),
+                    id="transcript_pane",
+                ),
+                Vertical(
+                    Label("AI - odpowiedzi", id="ai_title"),
+                    RichLog(id="ai_log", wrap=True, markup=False, highlight=False),
+                    id="ai_pane",
+                ),
+                id="logs",
+            ),
             Input(
                 placeholder="Wpisz komende (g, a doprecyzuj..., lang en, style tylko ryzyka, ctx 20m, q)",
                 id="session_input",
@@ -127,6 +140,17 @@ class SessionScreen(Screen[None]):
         if not raw:
             return
 
+        cmd = raw.strip().lower()
+
+        # Toggle the session commands/help window when user types 'h'
+        if cmd == "h":
+            try:
+                grid = self.query_one("#session_commands_grid", Horizontal)
+                grid.toggle_class("hidden")
+            except Exception:
+                pass
+            return
+
         self._write_log(f"> {raw}")
         self._commands.put(raw)
 
@@ -149,50 +173,75 @@ class SessionScreen(Screen[None]):
         self.app.call_from_thread(self._write_log, message)
 
     def _write_log(self, message: str) -> None:
-        log_widget = self.query_one("#session_log", RichLog)
+        transcript_widget = self.query_one("#transcript_log", RichLog)
+        ai_widget = self.query_one("#ai_log", RichLog)
+
         for line in message.splitlines() or [""]:
-            log_widget.write(self._style_log_line(line))
+            stripped = line.strip()
+
+            # Blank lines reset any ai block state and are written to both panes
+            if not stripped:
+                self._ai_log_block_kind = None
+                transcript_widget.write(Text(""))
+                ai_widget.write(Text(""))
+                continue
+
+            # Command echoes (user input) go to AI pane
+            if stripped.startswith(">"):
+                ai_widget.write(self._style_ai_line(line))
+                continue
+
+            # Transcript lines: timestamp + label (e.g. [12:00:00] [JA] ...)
+            if stripped.startswith("[") and "] [" in stripped:
+                transcript_widget.write(self._style_transcript_line(line))
+                continue
+
+            # All other messages (AI, system) go to AI pane
+            ai_widget.write(self._style_ai_line(line))
 
     def _style_log_line(self, line: str) -> Text:
+        # Deprecated: keep for compatibility; route through new stylers
+        return self._style_ai_line(line)
+
+    def _style_transcript_line(self, line: str) -> Text:
+        if "[JA]" in line or "[ME]" in line:
+            return Text(line, style="green")
+        if "[MEET" in line:
+            return Text(line, style="bright_blue")
+        return Text(line, style="white")
+
+    def _style_ai_line(self, line: str) -> Text:
         stripped = line.strip()
 
         if not stripped:
-            self._log_block_kind = None
+            self._ai_log_block_kind = None
             return Text("")
 
         if stripped.startswith(">"):
-            self._log_block_kind = None
+            self._ai_log_block_kind = None
             return Text(line, style="bold yellow")
 
         if stripped in {"[AI QUESTIONS]", "[AI CUSTOM RESPONSE]", "[AI RECENT ANSWERS]"}:
-            self._log_block_kind = "ai"
+            self._ai_log_block_kind = "ai"
             return Text(line, style="bold bright_cyan")
 
         if stripped.startswith("[AI error]"):
-            self._log_block_kind = None
+            self._ai_log_block_kind = None
             return Text(line, style="bold red")
 
         if stripped.startswith("[AI]"):
-            self._log_block_kind = None
+            self._ai_log_block_kind = None
             return Text(line, style="bright_cyan")
 
         if stripped.startswith("Session failed:"):
-            self._log_block_kind = None
+            self._ai_log_block_kind = None
             return Text(line, style="bold red")
 
         if stripped.startswith("Snapshot saved:"):
-            self._log_block_kind = None
+            self._ai_log_block_kind = None
             return Text(line, style="green")
 
-        if stripped.startswith("[") and "] [" in stripped:
-            self._log_block_kind = None
-            if "[JA]" in line or "[ME]" in line:
-                return Text(line, style="green")
-            if "[MEET" in line:
-                return Text(line, style="bright_blue")
-            return Text(line, style="white")
-
-        if self._log_block_kind == "ai":
+        if self._ai_log_block_kind == "ai":
             return Text(line, style="cyan")
 
         return Text(line, style="white")
@@ -480,10 +529,11 @@ class PowerBATui(App[None]):
     CSS = """
     Screen {
         align: center middle;
+        width: 100%;
     }
 
     #menu, #settings_form, #session_view {
-        width: 88;
+        width: 100%;
         max-height: 90%;
         padding: 1 2;
         border: round #4f7f6f;
@@ -523,10 +573,35 @@ class PowerBATui(App[None]):
         padding: 0 1 0 0;
     }
 
-    #session_log {
+    .hidden {
+        display: none;
+    }
+
+    #logs {
         height: 1fr;
+        margin-bottom: 1;
+    }
+
+    #transcript_pane {
+        height: 30%;
+        min-height: 6;
+        width: 100%;
+    }
+
+    #ai_pane {
+        height: 70%;
+        width: 100%;
+    }
+
+    #transcript_log {
         border: round #3f5f56;
         margin-bottom: 1;
+        height: 100%;
+    }
+
+    #ai_log {
+        border: round #3f5f56;
+        height: 100%;
     }
 
     #session_input {
