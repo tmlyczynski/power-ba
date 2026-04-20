@@ -40,7 +40,7 @@ def _build_system_instruction(ai_language: str, style_instruction: str) -> str:
     if language == "en":
         base = (
             "Prepare concrete follow-up questions or direct practical answers "
-            "based on the provided context. Respond in English."
+            "based on the provided context. Try to do it in the shortest and most understandable way. Respond in English."
         )
         if style:
             return f"{base}\nSession style instruction: {style}"
@@ -48,7 +48,7 @@ def _build_system_instruction(ai_language: str, style_instruction: str) -> str:
 
     base = (
         "Przygotuj konkretne pytania doprecyzowujace lub bezposrednie praktyczne "
-        "odpowiedzi na podstawie podanego kontekstu. Odpowiedz po polsku."
+        "odpowiedzi na podstawie podanego kontekstu. Postaraj się to zrobić w jak najkrótszy i najbardziej zrozumiały sposób. Odpowiedz po polsku."
     )
     if style:
         return f"{base}\nInstrukcja stylu sesji: {style}"
