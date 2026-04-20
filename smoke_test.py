@@ -5,7 +5,7 @@ from power_ba.runtime import run_session
 def main() -> None:
     cfg = AppConfig(
         provider="openai",
-        model="gpt-5-mini",
+        model="gpt-5.4-nano",
         openai_api_key="",
         anthropic_api_key="",
         mic_listening_enabled=True,

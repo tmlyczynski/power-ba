@@ -63,7 +63,7 @@ def _normalize_context_window_default(value: Any, fallback_seconds: int) -> str:
 @dataclass
 class AppConfig:
     provider: str = "openai"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-nano"
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     mic_listening_enabled: bool = True
@@ -103,7 +103,7 @@ class AppConfig:
         if self.provider not in {"openai", "anthropic"}:
             self.provider = "openai"
         if not self.model:
-            self.model = "gpt-5-mini"
+            self.model = "gpt-5.4-nano"
         if self.question_interval_seconds < 5:
             self.question_interval_seconds = 5
         normalized_language = self.ai_language.strip().lower()
